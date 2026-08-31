@@ -34,5 +34,7 @@
 	<string>https://eu.i.posthog.com</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>FluidVoice uses on-device speech recognition to transcribe your voice commands and text quickly and privately.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>FluidVoice needs screen recording access to understand context from your screen for improved transcription accuracy.</string>
 </dict>
 </plist>

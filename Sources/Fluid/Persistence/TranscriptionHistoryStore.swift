@@ -20,6 +20,10 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
     let characterCount: Int
     let wasAIProcessed: Bool
     let processingModel: String?
+    /// Wall-clock time spent in AI enhancement, including failed attempts.
+    let aiEnhancementDurationMs: Int?
+    /// Exact messages sent to the model (system, user, injected context).
+    let aiPromptSnapshot: String?
     /// Non-nil when AI post-processing was configured but failed and we fell
     /// back to typing the raw transcription. The string carries the error
     /// message for display / debugging.
@@ -35,6 +39,8 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         windowTitle: String,
         wasAIProcessed: Bool,
         processingModel: String? = nil,
+        aiEnhancementDurationMs: Int? = nil,
+        aiPromptSnapshot: String? = nil,
         aiProcessingError: String? = nil,
         audio: DictationAudioMetadata? = nil
     ) {
@@ -47,6 +53,8 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = processedText.count
         self.wasAIProcessed = wasAIProcessed
         self.processingModel = processingModel
+        self.aiEnhancementDurationMs = aiEnhancementDurationMs
+        self.aiPromptSnapshot = aiPromptSnapshot
         self.aiProcessingError = aiProcessingError
         self.audio = audio
     }
@@ -61,6 +69,8 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         characterCount: Int,
         wasAIProcessed: Bool,
         processingModel: String?,
+        aiEnhancementDurationMs: Int?,
+        aiPromptSnapshot: String?,
         aiProcessingError: String?,
         audio: DictationAudioMetadata?
     ) {
@@ -73,6 +83,8 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = characterCount
         self.wasAIProcessed = wasAIProcessed
         self.processingModel = processingModel
+        self.aiEnhancementDurationMs = aiEnhancementDurationMs
+        self.aiPromptSnapshot = aiPromptSnapshot
         self.aiProcessingError = aiProcessingError
         self.audio = audio
     }
@@ -88,13 +100,15 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = try container.decode(Int.self, forKey: .characterCount)
         self.wasAIProcessed = try container.decode(Bool.self, forKey: .wasAIProcessed)
         self.processingModel = try container.decodeIfPresent(String.self, forKey: .processingModel)
+        self.aiEnhancementDurationMs = try container.decodeIfPresent(Int.self, forKey: .aiEnhancementDurationMs)
+        self.aiPromptSnapshot = try container.decodeIfPresent(String.self, forKey: .aiPromptSnapshot)
         self.aiProcessingError = try container.decodeIfPresent(String.self, forKey: .aiProcessingError)
         self.audio = try container.decodeIfPresent(DictationAudioMetadata.self, forKey: .audio)
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, timestamp, rawText, processedText, appName, windowTitle
-        case characterCount, wasAIProcessed, processingModel, aiProcessingError, audio
+        case characterCount, wasAIProcessed, processingModel, aiEnhancementDurationMs, aiPromptSnapshot, aiProcessingError, audio
     }
 
     /// Preview text for list display (first 80 chars)
@@ -143,9 +157,49 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
             characterCount: self.characterCount,
             wasAIProcessed: self.wasAIProcessed,
             processingModel: self.processingModel,
+            aiEnhancementDurationMs: self.aiEnhancementDurationMs,
+            aiPromptSnapshot: self.aiPromptSnapshot,
             aiProcessingError: self.aiProcessingError,
             audio: audio
         )
+    }
+
+    var formattedAIEnhancementDuration: String? {
+        Self.formatDuration(milliseconds: self.aiEnhancementDurationMs)
+    }
+
+    static func formatDuration(milliseconds: Int?) -> String? {
+        guard let milliseconds, milliseconds >= 0 else { return nil }
+        if milliseconds < 1000 {
+            return "\(milliseconds) ms"
+        }
+        let seconds = Double(milliseconds) / 1000
+        if seconds < 10 {
+            return String(format: "%.1f s", seconds)
+        }
+        return String(format: "%.0f s", seconds)
+    }
+}
+
+struct AIEnhancementModelLatency: Equatable, Identifiable {
+    let model: String
+    let sampleCount: Int
+    let averageDurationMs: Int
+    let medianDurationMs: Int
+    let latestDurationMs: Int
+
+    var id: String { self.model }
+
+    var formattedAverage: String {
+        TranscriptionHistoryEntry.formatDuration(milliseconds: self.averageDurationMs) ?? "—"
+    }
+
+    var formattedMedian: String {
+        TranscriptionHistoryEntry.formatDuration(milliseconds: self.medianDurationMs) ?? "—"
+    }
+
+    var formattedLatest: String {
+        TranscriptionHistoryEntry.formatDuration(milliseconds: self.latestDurationMs) ?? "—"
     }
 }
 
@@ -190,6 +244,8 @@ final class TranscriptionHistoryStore: ObservableObject {
         windowTitle: String,
         wasAIProcessed: Bool? = nil,
         processingModel: String? = nil,
+        aiEnhancementDurationMs: Int? = nil,
+        aiPromptSnapshot: String? = nil,
         aiProcessingError: String? = nil,
         audio: DictationAudioMetadata? = nil
     ) {
@@ -205,6 +261,8 @@ final class TranscriptionHistoryStore: ObservableObject {
             windowTitle: windowTitle,
             wasAIProcessed: wasAIProcessed ?? (processingModel != nil && aiProcessingError == nil),
             processingModel: processingModel,
+            aiEnhancementDurationMs: aiEnhancementDurationMs,
+            aiPromptSnapshot: aiPromptSnapshot,
             aiProcessingError: aiProcessingError,
             audio: audio
         )
@@ -272,7 +330,8 @@ final class TranscriptionHistoryStore: ObservableObject {
             entry.rawText.lowercased().contains(lowercased) ||
                 entry.processedText.lowercased().contains(lowercased) ||
                 entry.appName.lowercased().contains(lowercased) ||
-                entry.windowTitle.lowercased().contains(lowercased)
+                entry.windowTitle.lowercased().contains(lowercased) ||
+                (entry.aiPromptSnapshot?.lowercased().contains(lowercased) ?? false)
         }
     }
 
@@ -289,6 +348,49 @@ final class TranscriptionHistoryStore: ObservableObject {
     /// Get count of AI-processed entries
     var aiProcessedCount: Int {
         self.entries.filter { $0.wasAIProcessed }.count
+    }
+
+    var aiEnhancementLatencyByModel: [AIEnhancementModelLatency] {
+        Self.aiEnhancementLatencyByModel(from: self.entries)
+    }
+
+    static func aiEnhancementLatencyByModel(
+        from entries: [TranscriptionHistoryEntry]
+    ) -> [AIEnhancementModelLatency] {
+        var durationsByModel: [String: [Int]] = [:]
+        var latestByModel: [String: Int] = [:]
+
+        for entry in entries {
+            guard let duration = entry.aiEnhancementDurationMs, duration >= 0 else { continue }
+            let modelName = entry.processingModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let key = modelName.isEmpty ? "Unknown model" : modelName
+            durationsByModel[key, default: []].append(duration)
+            if latestByModel[key] == nil {
+                latestByModel[key] = duration
+            }
+        }
+
+        return durationsByModel
+            .map { model, durations in
+                let sorted = durations.sorted()
+                let count = sorted.count
+                let median = count % 2 == 0
+                    ? Int(((Double(sorted[count / 2 - 1]) + Double(sorted[count / 2])) / 2).rounded())
+                    : sorted[count / 2]
+                return AIEnhancementModelLatency(
+                    model: model,
+                    sampleCount: count,
+                    averageDurationMs: Int((Double(sorted.reduce(0, +)) / Double(count)).rounded()),
+                    medianDurationMs: median,
+                    latestDurationMs: latestByModel[model] ?? sorted[count - 1]
+                )
+            }
+            .sorted {
+                if $0.sampleCount != $1.sampleCount {
+                    return $0.sampleCount > $1.sampleCount
+                }
+                return $0.model.localizedCaseInsensitiveCompare($1.model) == .orderedAscending
+            }
     }
 
     func makeBackupPayload() -> [TranscriptionHistoryEntry] {

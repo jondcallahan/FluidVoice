@@ -3314,6 +3314,9 @@ final class SettingsStore: ObservableObject {
             continuousDictationModeEnabled: self.continuousDictationModeEnabled,
             continuousDictationSpacingEnabled: self.continuousDictationSpacingEnabled,
             contextAwareCapitalizationEnabled: self.contextAwareCapitalizationEnabled,
+            useSelectedTextContext: self.useSelectedTextContext,
+            useClipboardContext: self.useClipboardContext,
+            useScreenCaptureContext: self.useScreenCaptureContext,
             pauseMediaDuringTranscription: self.pauseMediaDuringTranscription,
             automaticDictionaryLearningEnabled: self.automaticDictionaryLearningEnabled,
             pronunciationMatchingEnabled: self.pronunciationMatchingEnabled,
@@ -3487,6 +3490,15 @@ final class SettingsStore: ObservableObject {
         self.continuousDictationModeEnabled = restoredContinuousDictationModeEnabled
         self.continuousDictationSpacingEnabled = payload.continuousDictationSpacingEnabled ?? restoredContinuousDictationModeEnabled
         self.contextAwareCapitalizationEnabled = payload.contextAwareCapitalizationEnabled ?? restoredContinuousDictationModeEnabled
+        if let useSelectedTextContext = payload.useSelectedTextContext {
+            self.useSelectedTextContext = useSelectedTextContext
+        }
+        if let useClipboardContext = payload.useClipboardContext {
+            self.useClipboardContext = useClipboardContext
+        }
+        if let useScreenCaptureContext = payload.useScreenCaptureContext {
+            self.useScreenCaptureContext = useScreenCaptureContext
+        }
         self.pauseMediaDuringTranscription = payload.pauseMediaDuringTranscription
         if let automaticDictionaryLearningEnabled = payload.automaticDictionaryLearningEnabled {
             self.automaticDictionaryLearningEnabled = automaticDictionaryLearningEnabled
@@ -4461,6 +4473,67 @@ final class SettingsStore: ObservableObject {
         self.continuousDictationSpacingEnabled || self.contextAwareCapitalizationEnabled
     }
 
+    var useSelectedTextContext: Bool {
+        get { self.defaults.bool(forKey: Keys.useSelectedTextContext) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.useSelectedTextContext)
+        }
+    }
+
+    var useClipboardContext: Bool {
+        get { self.defaults.bool(forKey: Keys.useClipboardContext) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.useClipboardContext)
+        }
+    }
+
+    var useScreenCaptureContext: Bool {
+        get { self.defaults.bool(forKey: Keys.useScreenCaptureContext) }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue, forKey: Keys.useScreenCaptureContext)
+            if newValue {
+                Task { @MainActor in
+                    _ = await ScreenCaptureService.requestScreenCapturePermissionRegistration()
+                }
+            }
+        }
+    }
+
+    var needsRecordingContextCapture: Bool {
+        self.useSelectedTextContext || self.useClipboardContext || self.useScreenCaptureContext
+    }
+
+    static func appendRecordingContext(
+        to promptText: String,
+        snapshot: RecordingContextSnapshot,
+        useSelectedText: Bool,
+        useClipboard: Bool,
+        useScreenCapture: Bool
+    ) -> String {
+        let section = snapshot.promptContextSection(
+            useSelectedText: useSelectedText,
+            useClipboard: useClipboard,
+            useScreenCapture: useScreenCapture
+        )
+        guard !section.isEmpty else { return promptText }
+        let trimmedPrompt = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedPrompt.isEmpty { return section }
+        return "\(promptText)\n\n\(section)"
+    }
+
+    func appendRecordingContext(to promptText: String, snapshot: RecordingContextSnapshot) -> String {
+        Self.appendRecordingContext(
+            to: promptText,
+            snapshot: snapshot,
+            useSelectedText: self.useSelectedTextContext,
+            useClipboard: self.useClipboardContext,
+            useScreenCapture: self.useScreenCaptureContext
+        )
+    }
+
     // MARK: - Media Playback Control
 
     /// When enabled, automatically pauses system media playback when transcription starts.
@@ -5429,6 +5502,9 @@ private extension SettingsStore {
         static let continuousDictationModeEnabled = "ContinuousDictationModeEnabled"
         static let continuousDictationSpacingEnabled = "ContinuousDictationSpacingEnabled"
         static let contextAwareCapitalizationEnabled = "ContextAwareCapitalizationEnabled"
+        static let useSelectedTextContext = "UseSelectedTextContext"
+        static let useClipboardContext = "UseClipboardContext"
+        static let useScreenCaptureContext = "UseScreenCaptureContext"
 
         // Custom Dictionary
         static let customDictionaryEntries = "CustomDictionaryEntries"

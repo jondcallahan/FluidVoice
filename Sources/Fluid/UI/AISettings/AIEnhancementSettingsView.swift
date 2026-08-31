@@ -187,4 +187,109 @@ struct AIEnhancementSettingsView: View {
                 )
         )
     }
+
+    var contextAwarenessSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.dashed.badge.record")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(self.theme.palette.accent)
+                    .frame(width: 24, height: 24)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Context Awareness")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(self.theme.palette.primaryText)
+                    Text("Send selected text, clipboard, or on-screen window text with the enhancement prompt.")
+                        .font(.caption2)
+                        .foregroundStyle(self.theme.palette.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            VStack(spacing: 8) {
+                self.contextAwarenessToggleRow(
+                    title: "Selected Text",
+                    description: "Use selected text from the active app as context.",
+                    isOn: Binding(
+                        get: { self.settings.useSelectedTextContext },
+                        set: { self.settings.useSelectedTextContext = $0 }
+                    )
+                )
+                self.contextAwarenessToggleRow(
+                    title: "Clipboard",
+                    description: "Use clipboard text as context.",
+                    isOn: Binding(
+                        get: { self.settings.useClipboardContext },
+                        set: { self.settings.useClipboardContext = $0 }
+                    )
+                )
+                self.contextAwarenessToggleRow(
+                    title: "Screen",
+                    description: "Use captured on-screen text from the active window as context.",
+                    isOn: Binding(
+                        get: { self.settings.useScreenCaptureContext },
+                        set: { self.settings.useScreenCaptureContext = $0 }
+                    )
+                )
+            }
+
+            if self.settings.useScreenCaptureContext, !ScreenCaptureService.hasScreenCaptureAccess() {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(self.theme.palette.warning)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Screen Recording permission is required. Enable FluidVoice in System Settings, then restart the app.")
+                            .font(.caption2)
+                            .foregroundStyle(self.theme.palette.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Open Screen Recording Settings") {
+                            ScreenCaptureService.openScreenRecordingSettings()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(self.theme.palette.cardBackground.opacity(0.72))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(self.theme.palette.cardBorder.opacity(0.32), lineWidth: 1)
+                )
+        )
+    }
+
+    private func contextAwarenessToggleRow(
+        title: String,
+        description: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(self.theme.palette.primaryText)
+                Text(description)
+                    .font(.caption2)
+                    .foregroundStyle(self.theme.palette.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 12)
+
+            Toggle(title, isOn: isOn)
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .accessibilityLabel(title)
+        }
+    }
 }

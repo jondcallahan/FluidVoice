@@ -106,6 +106,9 @@ struct SettingsBackupPayload: Codable, Equatable {
     let continuousDictationModeEnabled: Bool?
     let continuousDictationSpacingEnabled: Bool?
     let contextAwareCapitalizationEnabled: Bool?
+    let useSelectedTextContext: Bool?
+    let useClipboardContext: Bool?
+    let useScreenCaptureContext: Bool?
     let pauseMediaDuringTranscription: Bool
     let automaticDictionaryLearningEnabled: Bool?
     let pronunciationMatchingEnabled: Bool?

@@ -46,6 +46,8 @@ struct StatsView: View {
                 // Insights
                 self.insightsCard
 
+                self.aiLatencyCard
+
                 // Personal Records
                 self.recordsCard
 
@@ -568,6 +570,62 @@ struct StatsView: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8)
             .fill(.quaternary.opacity(0.3)))
+    }
+
+    private var aiLatencyCard: some View {
+        let rows = self.historyStore.aiEnhancementLatencyByModel
+
+        return ThemedCard(style: .standard, padding: 16, hoverEffect: false) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("AI LATENCY BY MODEL", systemImage: "timer")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                if rows.isEmpty {
+                    Text("Latency is stored after each AI enhancement.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("Model")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text("Avg")
+                                .frame(width: 64, alignment: .trailing)
+                            Text("Median")
+                                .frame(width: 64, alignment: .trailing)
+                            Text("Last")
+                                .frame(width: 64, alignment: .trailing)
+                        }
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+
+                        ForEach(rows) { row in
+                            HStack(alignment: .firstTextBaseline) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(row.model)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(row.sampleCount == 1 ? "1 run" : "\(row.sampleCount) runs")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                Text(row.formattedAverage)
+                                    .frame(width: 64, alignment: .trailing)
+                                Text(row.formattedMedian)
+                                    .frame(width: 64, alignment: .trailing)
+                                Text(row.formattedLatest)
+                                    .frame(width: 64, alignment: .trailing)
+                            }
+                            .font(.system(size: 12, weight: .medium))
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Personal Records Card

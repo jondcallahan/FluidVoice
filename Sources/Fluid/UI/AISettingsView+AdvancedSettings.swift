@@ -66,6 +66,7 @@ extension AIEnhancementSettingsView {
                 self.promptProfilesHelpRow("Built-in is the normal prompt. Assign any prompt as Primary to use it with your main hotkey.")
                 self.promptProfilesHelpRow("\(PrivateAIProviderFeature.displayName) uses its own local prompt.")
                 self.promptProfilesHelpRow("Custom prompts can be assigned globally, by app, or by shortcut.")
+                self.promptProfilesHelpRow("Context Awareness can add selected text, clipboard, and on-screen window text to the enhancement prompt.")
             }
         }
         .padding(14)
@@ -964,6 +965,7 @@ extension AIEnhancementSettingsView {
 
                     if mode.normalized == .dictate {
                         self.customPromptOnlyToggleRow
+                        self.contextAwarenessSection
                     }
 
                     Text(

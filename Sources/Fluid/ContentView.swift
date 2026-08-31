@@ -245,6 +245,8 @@ struct ContentView: View {
     @State private var previousSidebarItem: SidebarItem? = nil // Track previous for mode transitions
     @State private var playgroundUsed: Bool = SettingsStore.shared.playgroundUsed
     @State private var recordingAppInfo: (name: String, bundleId: String, windowTitle: String)? = nil
+    @State private var recordingTargetProcessID: pid_t? = nil
+    @State private var lastAIPromptSnapshot: String? = nil
     @State private var recordingPrecedingText: String = ""
     @State private var recordingFocusTarget: TypingService.CapturedFocusTarget? = nil
 
@@ -1613,13 +1615,20 @@ struct ContentView: View {
     // MARK: - App Detection and Context-Aware Prompts
 
     private func getCurrentAppInfo() -> (name: String, bundleId: String, windowTitle: String) {
-        if let frontmostApp = NSWorkspace.shared.frontmostApplication {
-            let name = frontmostApp.localizedName ?? "Unknown"
-            let bundleId = frontmostApp.bundleIdentifier ?? "unknown"
-            let title = self.getFrontmostWindowTitle(ownerPid: frontmostApp.processIdentifier) ?? ""
-            return (name: name, bundleId: bundleId, windowTitle: title)
-        }
-        return (name: "Unknown", bundleId: "unknown", windowTitle: "")
+        RecordingAppContext.capture(preferredProcessID: self.recordingTargetProcessID).tuple
+    }
+
+    @discardableResult
+    private func snapshotRecordingAppContext(preferredProcessID: pid_t? = nil) -> RecordingAppContext {
+        let context = RecordingAppContext.capture(preferredProcessID: preferredProcessID)
+        self.recordingTargetProcessID = context.processID
+        self.recordingAppInfo = context.tuple
+        self.rewriteModeService.setPromptAppBundleID(context.bundleId)
+        DebugLogger.shared.debug(
+            "Captured recording app context: app=\(context.name), bundleId=\(context.bundleId), title=\(context.windowTitle)",
+            source: "ContentView"
+        )
+        return context
     }
 
     private func isSpokenSendBlockedApp(
@@ -1666,37 +1675,21 @@ struct ContentView: View {
         return outcome
     }
 
-    /// Best-effort frontmost window title lookup for the current app
-    private func getFrontmostWindowTitle(ownerPid: pid_t) -> String? {
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let windowInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
-            return nil
-        }
-        for info in windowInfo {
-            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == ownerPid else { continue }
-            if let name = info[kCGWindowName as String] as? String, name.isEmpty == false {
-                return name
-            }
-        }
-        return nil
-    }
-
     private func captureRecordingTargetContext() {
         // Capture the focused target PID BEFORE any overlay/UI changes.
         // Used to restore focus when the user interacts with overlay dropdowns.
         let focusTarget = TypingService.captureSystemFocusTarget()
         self.recordingFocusTarget = focusTarget
-        let focusedPID = focusTarget?.pid
-            ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let focusedPID = self.recordingTargetProcessID
+            ?? focusTarget?.pid
+            ?? RecordingAppContext.targetProcessID()
         NotchContentState.shared.recordingTargetPID = focusedPID
 
-        let info = self.getCurrentAppInfo()
-        self.recordingAppInfo = info
-        self.rewriteModeService.setPromptAppBundleID(info.bundleId)
-        DebugLogger.shared.debug(
-            "Captured recording app context: app=\(info.name), bundleId=\(info.bundleId), title=\(info.windowTitle)",
-            source: "ContentView"
-        )
+        if let info = self.recordingAppInfo {
+            self.rewriteModeService.setPromptAppBundleID(info.bundleId)
+        } else {
+            self.snapshotRecordingAppContext(preferredProcessID: focusedPID)
+        }
     }
 
     private func captureRecordingFormattingContextIfNeeded() {
@@ -1715,6 +1708,16 @@ struct ContentView: View {
     private func captureRecordingContext() {
         self.captureRecordingTargetContext()
         self.captureRecordingFormattingContextIfNeeded()
+    }
+
+    /// Starts screen/selection/clipboard capture without waiting.
+    /// Call this after overlay and `asr.start` have been kicked off.
+    private func startRecordingContextCaptureIfNeeded(preferredProcessID: pid_t? = nil) {
+        let preferredPID = preferredProcessID
+            ?? self.recordingTargetProcessID
+            ?? self.recordingFocusTarget?.pid
+            ?? RecordingAppContext.targetProcessID()
+        RecordingContextController.shared.startCaptureIfNeeded(preferredProcessID: preferredPID)
     }
 
     private func resolveTypingTargetPID() -> (pid: pid_t?, shouldRestoreOriginalFocus: Bool) {
@@ -1848,12 +1851,18 @@ struct ContentView: View {
 
     // MARK: - Modular AI Processing
 
+    private struct AIProcessingOutcome {
+        let text: String
+        let promptSnapshot: String?
+    }
+
     private func processTextWithAI(
         _ inputText: String,
         overrideSystemPrompt: String? = nil,
         dictationSlot: SettingsStore.DictationShortcutSlot? = nil,
         streamHandler: PrivateAIStreamHandler? = nil
-    ) async throws -> String {
+    ) async throws -> AIProcessingOutcome {
+        self.lastAIPromptSnapshot = nil
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
         let route = DictationProviderRoute.resolve(
             settings: SettingsStore.shared,
@@ -1880,11 +1889,36 @@ struct ContentView: View {
             isDictationCall &&
             (isPrivateAIProvider || PrivateAIIntegrationService.shouldHandleDictation(model: derivedSelectedModel))
 
+        let contextSnapshot = isDictationCall
+            ? RecordingContextController.shared.snapshot()
+            : RecordingContextSnapshot()
+        let contextSection = contextSnapshot.promptContextSection(
+            useSelectedText: SettingsStore.shared.useSelectedTextContext,
+            useClipboard: SettingsStore.shared.useClipboardContext,
+            useScreenCapture: SettingsStore.shared.useScreenCaptureContext
+        )
+
         if usePrivateAIProvider {
+            let promptSnapshot = AIPromptSnapshotFormatter.format(messages: [
+                ("user", inputText),
+                (
+                    "provider_context",
+                    """
+                    Application: \(appInfo.name)
+                    Bundle ID: \(appInfo.bundleId)
+                    Window: \(appInfo.windowTitle)
+                    """
+                ),
+            ])
+            self.lastAIPromptSnapshot = promptSnapshot
+
             if self.shouldTracePromptProcessing {
                 self.logDictationPromptTrace("Private AI Provider task", value: "dictationEnhancement")
                 self.logDictationPromptTrace("Input transcription (Q)", value: inputText)
-                self.logDictationPromptTrace("Selected context text", value: "<none (dictation mode)>")
+                self.logDictationPromptTrace(
+                    "Selected context text",
+                    value: contextSection.isEmpty ? "<none (dictation mode)>" : contextSection
+                )
             }
 
             let response = try await PrivateAIIntegrationService.shared.enhanceDictation(
@@ -1912,15 +1946,18 @@ struct ContentView: View {
             if self.shouldTracePromptProcessing {
                 self.logDictationPromptTrace("Model answer (A)", value: response.outputText)
             }
-            return response.outputText
+            return AIProcessingOutcome(text: response.outputText, promptSnapshot: promptSnapshot)
         }
 
         // Resolve the effective prompt once so every provider path honors
         // transient overrides such as "Transcribe with Prompt".
         let promptText: String = {
             let override = overrideSystemPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !override.isEmpty { return override }
-            return self.buildSystemPrompt(appInfo: appInfo, dictationSlot: dictationSlot)
+            let resolved = !override.isEmpty
+                ? override
+                : self.buildSystemPrompt(appInfo: appInfo, dictationSlot: dictationSlot)
+            guard isDictationCall else { return resolved }
+            return SettingsStore.shared.appendRecordingContext(to: resolved, snapshot: contextSnapshot)
         }()
 
         // Dictation enhancement folds the prompt + transcript into a single user
@@ -1982,7 +2019,10 @@ struct ContentView: View {
             if userMessageContent != inputText {
                 self.logDictationPromptTrace("Final user message sent to model", value: userMessageContent)
             }
-            self.logDictationPromptTrace("Selected context text", value: "<none (dictation mode)>")
+            self.logDictationPromptTrace(
+                "Selected context text",
+                value: contextSection.isEmpty ? "<none (dictation mode)>" : contextSection
+            )
         }
 
         // Check if this model doesn't support the temperature parameter
@@ -2018,6 +2058,8 @@ struct ContentView: View {
             messages.append(["role": "system", "content": systemPrompt])
         }
         messages.append(["role": "user", "content": userMessageContent])
+        let promptSnapshot = AIPromptSnapshotFormatter.format(messages: messages)
+        self.lastAIPromptSnapshot = promptSnapshot
 
         let enableStreaming = streamHandler != nil
 
@@ -2080,7 +2122,7 @@ struct ContentView: View {
         guard !response.content.isEmpty else {
             throw AIProcessingError.emptyResponse
         }
-        return response.content
+        return AIProcessingOutcome(text: response.content, promptSnapshot: promptSnapshot)
     }
 
     // MARK: - Streaming Response Handler (DEPRECATED - Now handled by LLMClient)
@@ -2198,7 +2240,7 @@ struct ContentView: View {
                 let result = try await self.processTextWithAI(transcribedText, overrideSystemPrompt: promptTest.draftPromptText)
                 let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
                 let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
-                    result,
+                    result.text,
                     appName: appInfo.name,
                     bundleID: appInfo.bundleId,
                     windowTitle: appInfo.windowTitle
@@ -2243,6 +2285,8 @@ struct ContentView: View {
         var finalText: String
         var aiFallbackReason: String?
         var postProcessingModel: String?
+        var aiEnhancementDurationMs: Int?
+        var aiPromptSnapshot: String?
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
         let punctuationFormattedText = ASRService.applySpokenPunctuationFormatting(
             transcribedText,
@@ -2299,12 +2343,14 @@ struct ContentView: View {
             }
 
             do {
-                finalText = try await self.processTextWithAI(
+                let outcome = try await self.processTextWithAI(
                     normalizedTranscribedText,
                     overrideSystemPrompt: promptOverride,
                     dictationSlot: activeDictationSlot,
                     streamHandler: streamHandler
                 )
+                finalText = outcome.text
+                aiPromptSnapshot = outcome.promptSnapshot
                 await streamPreview.flush()
             } catch {
                 // Fall back to the raw transcription so the user still gets
@@ -2314,6 +2360,7 @@ struct ContentView: View {
                     source: "ContentView"
                 )
                 aiFallbackReason = error.localizedDescription
+                aiPromptSnapshot = self.lastAIPromptSnapshot
                 // Configuration errors are actionable — point the user at settings
                 // rather than just echoing the technical error string.
                 if let aiError = error as? AIProcessingError,
@@ -2328,6 +2375,7 @@ struct ContentView: View {
                 finalText = normalizedTranscribedText
             }
             let postProcessingLatencyMs = Int((Date().timeIntervalSince(postProcessingStart) * 1000).rounded())
+            aiEnhancementDurationMs = postProcessingLatencyMs
             let postProcessingProviderName = postProcessingModelInfo.provider ?? "unknown"
             let postProcessingModelName = postProcessingModelInfo.model ?? "unknown"
             DebugLogger.shared.info(
@@ -2423,6 +2471,8 @@ struct ContentView: View {
                 windowTitle: appInfo.windowTitle,
                 wasAIProcessed: postProcessingModel != nil && aiFallbackReason == nil,
                 processingModel: postProcessingModel,
+                aiEnhancementDurationMs: aiEnhancementDurationMs,
+                aiPromptSnapshot: aiPromptSnapshot,
                 aiProcessingError: aiFallbackReason
             )
             self.persistDictationAudioIfNeeded(
@@ -2966,6 +3016,8 @@ struct ContentView: View {
 
         var aiFallbackReason: String?
         var postProcessingModel: String?
+        var aiEnhancementDurationMs: Int?
+        var aiPromptSnapshot: String?
         let appInfo = self.getCurrentAppInfo()
         let normalizedTranscribedText = ASRService.applySpokenPunctuationFormatting(
             transcribedText,
@@ -2980,20 +3032,25 @@ struct ContentView: View {
                 dictationSlot: .primary,
                 appBundleID: appInfo.bundleId
             ).model
+            let postProcessingStart = Date()
             do {
-                finalText = try await self.processTextWithAI(
+                let outcome = try await self.processTextWithAI(
                     normalizedTranscribedText,
                     dictationSlot: .primary
                 )
+                finalText = outcome.text
+                aiPromptSnapshot = outcome.promptSnapshot
             } catch {
                 DebugLogger.shared.error(
                     "AI reprocess failed, falling back to raw transcription: \(error.localizedDescription)",
                     source: "ContentView"
                 )
                 aiFallbackReason = error.localizedDescription
+                aiPromptSnapshot = self.lastAIPromptSnapshot
                 NotificationService.showAIProcessingFallback(error: error.localizedDescription)
                 finalText = normalizedTranscribedText
             }
+            aiEnhancementDurationMs = Int((Date().timeIntervalSince(postProcessingStart) * 1000).rounded())
         }
 
         NotchOverlayManager.shared.updateTranscriptionText("")
@@ -3031,6 +3088,8 @@ struct ContentView: View {
                 windowTitle: appInfo.windowTitle,
                 wasAIProcessed: postProcessingModel != nil && aiFallbackReason == nil,
                 processingModel: postProcessingModel,
+                aiEnhancementDurationMs: aiEnhancementDurationMs,
+                aiPromptSnapshot: aiPromptSnapshot,
                 aiProcessingError: aiFallbackReason
             )
         }
@@ -3228,6 +3287,7 @@ struct ContentView: View {
             return
         }
 
+        let context = self.snapshotRecordingAppContext()
         self.advanceOverlayLifecycle()
         self.setActiveRecordingMode(.dictate)
         let shouldShowDictationOverlay = !self.isRecordingForCommand
@@ -3236,6 +3296,8 @@ struct ContentView: View {
         let shouldPlayStartSound = !self.isRecordingForCommand
             && !self.isRecordingForRewrite
             && self.asr.micStatus == .authorized
+
+        let contextTargetPID = context.processID
 
         // Ensure normal dictation mode is set (command/rewrite modes set their own)
         if shouldShowDictationOverlay {
@@ -3265,6 +3327,8 @@ struct ContentView: View {
                 self.menuBarManager.hideRecordingOverlayImmediately(reason: "asr_start_failed")
             }
         }
+
+        self.startRecordingContextCaptureIfNeeded(preferredProcessID: contextTargetPID)
 
         // Pre-load model in background while recording (avoids 10s freeze on stop)
         Task {
@@ -3500,6 +3564,7 @@ struct ContentView: View {
             },
             commandModeCallback: {
                 DebugLogger.shared.info("Command mode triggered", source: "ContentView")
+                self.snapshotRecordingAppContext()
                 self.captureRecordingContext()
 
                 // Set flag so stopAndProcessTranscription knows to process as command
@@ -3528,8 +3593,10 @@ struct ContentView: View {
                         )
                     }
                 }
+                self.startRecordingContextCaptureIfNeeded()
             },
             rewriteModeCallback: {
+                self.snapshotRecordingAppContext()
                 self.captureRecordingContext()
 
                 // Try to capture text first while still in the other app
@@ -3572,6 +3639,7 @@ struct ContentView: View {
                         )
                     }
                 }
+                self.startRecordingContextCaptureIfNeeded()
             },
             isDictateRecordingProvider: {
                 self.activeRecordingMode == .dictate
@@ -3912,6 +3980,8 @@ extension ContentView {
         if isOnboardingTryout {
             AnalyticsService.shared.recordOnboardingTryoutAttemptStarted(startMethod: startMethod)
         }
+        let context = self.snapshotRecordingAppContext()
+        let contextTargetPID = context.processID
         self.advanceOverlayLifecycle()
         if self.asr.micStatus == .authorized {
             self.appBench("overlay_mode_request mode=Dictation")
@@ -3946,6 +4016,7 @@ extension ContentView {
                 source: "AppBenchmark"
             )
         }
+        self.startRecordingContextCaptureIfNeeded(preferredProcessID: contextTargetPID)
     }
 
     private func beginDictationRecording(for selection: SettingsStore.DictationPromptSelection, mode: ActiveRecordingMode) {
@@ -3965,7 +4036,7 @@ extension ContentView {
 
         do {
             let result = try await processTextWithAI(aiInputText)
-            await MainActor.run { self.aiOutputText = result }
+            await MainActor.run { self.aiOutputText = result.text }
         } catch {
             DebugLogger.shared.error("callOpenAIChat failed: \(error.localizedDescription)", source: "ContentView")
             await MainActor.run { self.aiOutputText = "Error: \(error.localizedDescription)" }

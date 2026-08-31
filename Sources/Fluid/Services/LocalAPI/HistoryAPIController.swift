@@ -17,6 +17,9 @@ struct HistoryAPIController: LocalAPIRouteHandler {
         let windowTitle: String
         let characterCount: Int
         let wasAIProcessed: Bool
+        let processingModel: String?
+        let aiEnhancementDurationMs: Int?
+        let aiPromptSnapshot: String?
         let aiProcessingError: String?
     }
 
@@ -40,6 +43,9 @@ struct HistoryAPIController: LocalAPIRouteHandler {
                     windowTitle: entry.windowTitle,
                     characterCount: entry.characterCount,
                     wasAIProcessed: entry.wasAIProcessed,
+                    processingModel: entry.processingModel,
+                    aiEnhancementDurationMs: entry.aiEnhancementDurationMs,
+                    aiPromptSnapshot: entry.aiPromptSnapshot,
                     aiProcessingError: entry.aiProcessingError
                 )
             }

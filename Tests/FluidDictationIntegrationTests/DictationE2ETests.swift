@@ -98,6 +98,76 @@ final class DictationE2ETests: XCTestCase {
         XCTAssertNil(entry.clipboardText)
     }
 
+    func testAIEnhancementDurationFormatting() {
+        XCTAssertEqual(TranscriptionHistoryEntry.formatDuration(milliseconds: 842), "842 ms")
+        XCTAssertEqual(TranscriptionHistoryEntry.formatDuration(milliseconds: 1200), "1.2 s")
+        XCTAssertEqual(TranscriptionHistoryEntry.formatDuration(milliseconds: 10500), "11 s")
+        XCTAssertNil(TranscriptionHistoryEntry.formatDuration(milliseconds: nil))
+    }
+
+    func testAIEnhancementLatencyByModelAggregatesNewestAsLatest() {
+        let older = TranscriptionHistoryEntry(
+            timestamp: Date().addingTimeInterval(-60),
+            rawText: "one",
+            processedText: "One.",
+            appName: "Notes",
+            windowTitle: "Draft",
+            wasAIProcessed: true,
+            processingModel: "gpt-4o-mini",
+            aiEnhancementDurationMs: 900
+        )
+        let newer = TranscriptionHistoryEntry(
+            timestamp: Date(),
+            rawText: "two",
+            processedText: "Two.",
+            appName: "Notes",
+            windowTitle: "Draft",
+            wasAIProcessed: true,
+            processingModel: "gpt-4o-mini",
+            aiEnhancementDurationMs: 400
+        )
+        let other = TranscriptionHistoryEntry(
+            timestamp: Date(),
+            rawText: "three",
+            processedText: "Three.",
+            appName: "Mail",
+            windowTitle: "Inbox",
+            wasAIProcessed: true,
+            processingModel: "claude-sonnet-4",
+            aiEnhancementDurationMs: 1800
+        )
+
+        let rows = TranscriptionHistoryStore.aiEnhancementLatencyByModel(from: [newer, older, other])
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0].model, "gpt-4o-mini")
+        XCTAssertEqual(rows[0].sampleCount, 2)
+        XCTAssertEqual(rows[0].averageDurationMs, 650)
+        XCTAssertEqual(rows[0].medianDurationMs, 650)
+        XCTAssertEqual(rows[0].latestDurationMs, 400)
+        XCTAssertEqual(rows[1].model, "claude-sonnet-4")
+        XCTAssertEqual(rows[1].formattedAverage, "1.8 s")
+    }
+
+    func testTranscriptionHistoryEntryDecodesMissingPromptSnapshot() throws {
+        let json = """
+        {
+          "id": "11111111-1111-1111-1111-111111111111",
+          "timestamp": 0,
+          "rawText": "hello",
+          "processedText": "Hello.",
+          "appName": "Notes",
+          "windowTitle": "Draft",
+          "characterCount": 6,
+          "wasAIProcessed": true
+        }
+        """.data(using: .utf8)!
+
+        let entry = try JSONDecoder().decode(TranscriptionHistoryEntry.self, from: json)
+        XCTAssertNil(entry.aiPromptSnapshot)
+        XCTAssertEqual(entry.appName, "Notes")
+        XCTAssertEqual(entry.windowTitle, "Draft")
+    }
+
     func testTranscriptionStartSound_noneOptionHasNoFile() {
         XCTAssertEqual(SettingsStore.TranscriptionStartSound.none.displayName, "None")
         XCTAssertNil(SettingsStore.TranscriptionStartSound.none.startSoundFileName)

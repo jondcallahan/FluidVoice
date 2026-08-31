@@ -159,6 +159,12 @@ struct TranscriptionHistoryView: View {
                             )
                     }
 
+                    if let duration = entry.formattedAIEnhancementDuration {
+                        Text(duration)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(isSelected ? .white.opacity(0.75) : Color.secondary.opacity(0.8))
+                    }
+
                     if self.hasAudio(entry) {
                         Image(systemName: "waveform")
                             .font(.system(size: 10, weight: .semibold))
@@ -390,6 +396,18 @@ struct TranscriptionHistoryView: View {
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                         }
+
+                        if let prompt = entry.aiPromptSnapshot, !prompt.isEmpty {
+                            Button {
+                                self.copyToClipboard(prompt)
+                            } label: {
+                                Label("Prompt", systemImage: "doc.text")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Copy the exact prompt sent to the model")
+                        }
                     }
 
                     Text(entry.fullDateString)
@@ -442,6 +460,16 @@ struct TranscriptionHistoryView: View {
                     )
                 }
 
+                if let prompt = entry.aiPromptSnapshot, !prompt.isEmpty {
+                    self.detailSection(
+                        title: "AI Prompt Snapshot",
+                        content: prompt,
+                        badge: "Raw",
+                        isSecondary: true,
+                        isMonospaced: true
+                    )
+                }
+
                 Divider()
                     .opacity(0.3)
 
@@ -477,7 +505,8 @@ struct TranscriptionHistoryView: View {
         title: String,
         content: String,
         badge: String?,
-        isSecondary: Bool = false
+        isSecondary: Bool = false,
+        isMonospaced: Bool = false
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
@@ -501,7 +530,7 @@ struct TranscriptionHistoryView: View {
             }
 
             Text(content)
-                .font(.system(size: 14, design: .default))
+                .font(.system(size: isMonospaced ? 12 : 14, design: isMonospaced ? .monospaced : .default))
                 .foregroundStyle(isSecondary ? .secondary : .primary)
                 .textSelection(.enabled)
                 .padding(14)
@@ -514,7 +543,9 @@ struct TranscriptionHistoryView: View {
     }
 
     private func metadataGrid(_ entry: TranscriptionHistoryEntry) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let model = entry.processingModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return VStack(alignment: .leading, spacing: 12) {
             Text("Details")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -529,6 +560,12 @@ struct TranscriptionHistoryView: View {
                 self.metadataItem(icon: "macwindow", label: "Window", value: entry.windowTitle.isEmpty ? "Unknown" : entry.windowTitle)
                 self.metadataItem(icon: "character.cursor.ibeam", label: "Characters", value: "\(entry.characterCount)")
                 self.metadataItem(icon: "sparkles", label: "AI Processed", value: entry.wasAIProcessed ? "Yes" : "No")
+                self.metadataItem(icon: "cpu", label: "AI Model", value: model.isEmpty ? "—" : model)
+                self.metadataItem(
+                    icon: "timer",
+                    label: "AI Latency",
+                    value: entry.formattedAIEnhancementDuration ?? "—"
+                )
                 self.metadataItem(icon: "waveform", label: "Audio", value: self.audioMetadataText(for: entry))
             }
         }

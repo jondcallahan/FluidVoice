@@ -198,7 +198,11 @@ final class DictationPostProcessingService {
             )
         }
 
-        let promptText = settings.effectiveDictationSystemPrompt(for: dictationSlot, appBundleID: nil)
+        let snapshot = RecordingContextController.shared.snapshot()
+        let promptText = settings.appendRecordingContext(
+            to: settings.effectiveDictationSystemPrompt(for: dictationSlot, appBundleID: nil),
+            snapshot: snapshot
+        )
         let systemPrompt = ""
         let userMessageContent = SettingsStore.renderDictationUserMessage(
             promptText: promptText,
