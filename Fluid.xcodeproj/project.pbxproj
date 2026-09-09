@@ -13,6 +13,7 @@
 		7C5AF14C2F15041600DE21B0 /* MediaRemoteAdapter in Embed Frameworks */ = {isa = PBXBuildFile; productRef = 7C5AF14A2F15041600DE21B0 /* MediaRemoteAdapter */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		7C9A71022F58B00000FB7CAF /* TranscribeCpp in Frameworks */ = {isa = PBXBuildFile; productRef = 7C9A71012F58B00000FB7CAF /* TranscribeCpp */; };
 		7C91B0012F42AA0100C0DEF0 /* HotkeyShortcutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C91B0022F42AA0100C0DEF0 /* HotkeyShortcutTests.swift */; };
+		C0DE89000000000000000002 /* SettingsNavigationStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE89000000000000000001 /* SettingsNavigationStateTests.swift */; };
 		7CDB0A2D2F3C4D5600FB7CAD /* DictationE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CDB0A292F3C4D5600FB7CAD /* DictationE2ETests.swift */; };
 		B52000000000000000000002 /* PrivateAIDictationTokenBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B52000000000000000000001 /* PrivateAIDictationTokenBudgetTests.swift */; };
 		CD1C7A0000000000000000B2 /* CustomDictionaryManualEntryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD1C7A0000000000000000B1 /* CustomDictionaryManualEntryTests.swift */; };
@@ -33,6 +34,7 @@
 		B51800000000000000000002 /* SpokenSendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B51800000000000000000001 /* SpokenSendTests.swift */; };
 		B51900000000000000000002 /* PrivateAIProviderPromptFormatTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B51900000000000000000001 /* PrivateAIProviderPromptFormatTests.swift */; };
 		C0DE63700000000000000002 /* WhisperLanguageSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE63700000000000000001 /* WhisperLanguageSelectionTests.swift */; };
+		CACEC0010000000000000002 /* KeychainServiceCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CACEC0010000000000000001 /* KeychainServiceCacheTests.swift */; };
 		7CDB0A2F2F3C4D5600FB7CAD /* dictation_fixture.wav in Resources */ = {isa = PBXBuildFile; fileRef = 7CDB0A2B2F3C4D5600FB7CAD /* dictation_fixture.wav */; };
 		7CDB0A302F3C4D5600FB7CAD /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7CDB0A2C2F3C4D5600FB7CAD /* XCTest.framework */; };
 		7CE006BD2E80EBE600DDCCD6 /* AppUpdater in Frameworks */ = {isa = PBXBuildFile; productRef = 7CE006BC2E80EBE600DDCCD6 /* AppUpdater */; };
@@ -76,8 +78,10 @@
 		B51900000000000000000001 /* PrivateAIProviderPromptFormatTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivateAIProviderPromptFormatTests.swift; sourceTree = "<group>"; };
 		B52000000000000000000001 /* PrivateAIDictationTokenBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivateAIDictationTokenBudgetTests.swift; sourceTree = "<group>"; };
 		C0DE63700000000000000001 /* WhisperLanguageSelectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhisperLanguageSelectionTests.swift; sourceTree = "<group>"; };
+		CACEC0010000000000000001 /* KeychainServiceCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainServiceCacheTests.swift; sourceTree = "<group>"; };
 		7C078D8F2E3B339200FB7CAC /* FluidVoice Debug.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "FluidVoice Debug.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		7C91B0022F42AA0100C0DEF0 /* HotkeyShortcutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyShortcutTests.swift; sourceTree = "<group>"; };
+		C0DE89000000000000000001 /* SettingsNavigationStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsNavigationStateTests.swift; sourceTree = "<group>"; };
 		7CDB0A202F3C4D5600FB7CAD /* FluidDictationIntegrationTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FluidDictationIntegrationTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7CDB0A292F3C4D5600FB7CAD /* DictationE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DictationE2ETests.swift; sourceTree = "<group>"; };
 		CD1C7A0000000000000000B1 /* CustomDictionaryManualEntryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomDictionaryManualEntryTests.swift; sourceTree = "<group>"; };
@@ -157,6 +161,7 @@
 				7CDB0A292F3C4D5600FB7CAD /* DictationE2ETests.swift */,
 				CD1C7A0000000000000000B1 /* CustomDictionaryManualEntryTests.swift */,
 				7C91B0022F42AA0100C0DEF0 /* HotkeyShortcutTests.swift */,
+				C0DE89000000000000000001 /* SettingsNavigationStateTests.swift */,
 				343B29013F4441D6A797D12D /* LLMClientRequestBodyTests.swift */,
 				980330F3CE464336ADCE3E23 /* TemperatureSupportTests.swift */,
 				A11A00000000000000000001 /* AnalyticsDatabaseTests.swift */,
@@ -171,6 +176,7 @@
 				B51900000000000000000001 /* PrivateAIProviderPromptFormatTests.swift */,
 				B52000000000000000000001 /* PrivateAIDictationTokenBudgetTests.swift */,
 				C0DE63700000000000000001 /* WhisperLanguageSelectionTests.swift */,
+				CACEC0010000000000000001 /* KeychainServiceCacheTests.swift */,
 				0B05F11E000000000000A001 /* SupportedFileExtensionsTests.swift */,
 				A0C07E170000000000000001 /* RecordingContextPromptTests.swift */,
 			);
@@ -333,6 +339,7 @@
 				B52000000000000000000002 /* PrivateAIDictationTokenBudgetTests.swift in Sources */,
 				CD1C7A0000000000000000B2 /* CustomDictionaryManualEntryTests.swift in Sources */,
 				7C91B0012F42AA0100C0DEF0 /* HotkeyShortcutTests.swift in Sources */,
+				C0DE89000000000000000002 /* SettingsNavigationStateTests.swift in Sources */,
 				86CAA2D4EF18433096185602 /* LLMClientRequestBodyTests.swift in Sources */,
 				272BFB5CB271489892CAE50C /* TemperatureSupportTests.swift in Sources */,
 				A11A00000000000000000002 /* AnalyticsDatabaseTests.swift in Sources */,
@@ -346,6 +353,7 @@
 				B51800000000000000000002 /* SpokenSendTests.swift in Sources */,
 				B51900000000000000000002 /* PrivateAIProviderPromptFormatTests.swift in Sources */,
 				C0DE63700000000000000002 /* WhisperLanguageSelectionTests.swift in Sources */,
+				CACEC0010000000000000002 /* KeychainServiceCacheTests.swift in Sources */,
 				0B05F11E000000000000A002 /* SupportedFileExtensionsTests.swift in Sources */,
 				A0C07E170000000000000002 /* RecordingContextPromptTests.swift in Sources */,
 			);
@@ -526,7 +534,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.5.1;
-				PRODUCT_BUNDLE_IDENTIFIER = com.FluidApp.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.FluidApp.app.debug;
 				PRODUCT_NAME = "FluidVoice Debug";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;

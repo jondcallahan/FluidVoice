@@ -8,6 +8,33 @@ import XCTest
 
 @MainActor
 final class LLMClientRequestBodyTests: XCTestCase {
+    func testDictationStreamingFallbackSkipsTransportFailuresAndCancellation() {
+        XCTAssertFalse(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(
+                after: LLMError.networkError(URLError(.notConnectedToInternet))
+            )
+        )
+        XCTAssertFalse(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(after: CancellationError())
+        )
+        XCTAssertFalse(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(
+                after: LLMError.invalidRequest("missing prompt")
+            )
+        )
+    }
+
+    func testDictationStreamingFallbackRetriesProtocolFailure() {
+        XCTAssertTrue(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(after: LLMError.invalidResponse)
+        )
+        XCTAssertTrue(
+            DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(
+                after: LLMError.httpError(400, "streaming unsupported")
+            )
+        )
+    }
+
     private func config(streaming: Bool) -> LLMClient.Config {
         LLMClient.Config(
             messages: [["role": "user", "content": "hello"]],
@@ -158,6 +185,32 @@ final class LLMClientRequestBodyTests: XCTestCase {
         }
     }
 
+    func testCustomPromptOnly_shortcutProfileOverrideOmitsBasePrompt() {
+        self.withPromptSettingsRestored {
+            let settings = SettingsStore.shared
+            self.resetPromptSettings(settings)
+
+            let profile = SettingsStore.DictationPromptProfile(
+                name: "Cleaner",
+                prompt: "Normalize the transcript. Output only the cleaned text.",
+                mode: .dictate
+            )
+            settings.dictationPromptProfiles = [profile]
+            settings.sendCustomPromptOnly = true
+
+            XCTAssertEqual(
+                settings.shortcutOverrideSystemPrompt(for: profile),
+                profile.prompt
+            )
+
+            settings.sendCustomPromptOnly = false
+            XCTAssertEqual(
+                settings.shortcutOverrideSystemPrompt(for: profile),
+                SettingsStore.combineBasePrompt(for: .dictate, with: profile.prompt)
+            )
+        }
+    }
+
     private static let basePromptMarker = "You are a voice-to-text dictation cleaner"
 
     private func resetPromptSettings(_ settings: SettingsStore) {
@@ -246,10 +299,52 @@ final class LLMClientStreamingTests: XCTestCase {
         XCTAssertEqual(response.toolCalls.first?.getString("command"), "pwd")
     }
 
+    func testStreamingDecodeAndCallbacksStayOffMainThread() async throws {
+        let client = self.makeClient()
+        let probe = LLMCallbackThreadProbe()
+        var config = LLMClient.Config(
+            messages: [["role": "user", "content": "Keep UI responsive"]],
+            model: "qwen-thinking",
+            baseURL: "https://issue-445.test/tag-parser/v1",
+            apiKey: "",
+            streaming: true
+        )
+        config.maxRetries = 1
+        config.timeoutSeconds = 5
+        config.onContentChunk = { _ in probe.recordCallback() }
+
+        let response = try await client.call(config)
+
+        XCTAssertEqual(response.content, "Ready.")
+        XCTAssertGreaterThan(probe.callbackCount, 0)
+        XCTAssertFalse(probe.sawMainThread)
+    }
+
     private func makeClient() -> LLMClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [Issue445StreamURLProtocol.self]
         return LLMClient(session: URLSession(configuration: configuration))
+    }
+}
+
+private final nonisolated class LLMCallbackThreadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedCallbackCount = 0
+    private var recordedMainThreadCallback = false
+
+    var callbackCount: Int {
+        self.lock.withLock { self.recordedCallbackCount }
+    }
+
+    var sawMainThread: Bool {
+        self.lock.withLock { self.recordedMainThreadCallback }
+    }
+
+    func recordCallback() {
+        self.lock.withLock {
+            self.recordedCallbackCount += 1
+            self.recordedMainThreadCallback = self.recordedMainThreadCallback || Thread.isMainThread
+        }
     }
 }
 

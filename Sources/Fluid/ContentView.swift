@@ -15,7 +15,7 @@ import SwiftUI
 
 // MARK: - AI Processing Errors
 
-enum AIProcessingError: LocalizedError {
+nonisolated enum AIProcessingError: LocalizedError {
     case noVerifiedProvider
     case missingAPIKey(provider: String)
     case missingModel(provider: String)
@@ -37,7 +37,7 @@ enum AIProcessingError: LocalizedError {
         }
     }
 
-    /// Configuration errors the user can fix in AI Enhancement settings.
+    /// Configuration errors the user can fix in AI Providers.
     var isConfigurationError: Bool {
         switch self {
         case .noVerifiedProvider, .missingAPIKey, .missingModel:
@@ -48,47 +48,100 @@ enum AIProcessingError: LocalizedError {
     }
 }
 
-@MainActor
-private final class DictationAIStreamPreviewBuffer {
-    private var chunks: [String] = []
-    private var lastUIUpdate = CFAbsoluteTimeGetCurrent()
-    private let minimumUpdateInterval: CFTimeInterval = 0.033
-
-    func append(_ chunk: String) {
-        guard !chunk.isEmpty else { return }
-        self.chunks.append(chunk)
-
-        let now = CFAbsoluteTimeGetCurrent()
-        guard now - self.lastUIUpdate >= self.minimumUpdateInterval else { return }
-        self.lastUIUpdate = now
-        self.publish()
+nonisolated enum DictationAIFailurePresentationPolicy {
+    static func shouldPresent(shouldPersistOutputs: Bool, fallbackReason: String?) -> Bool {
+        shouldPersistOutputs && fallbackReason != nil
     }
 
-    func flush() {
-        self.publish()
-    }
-
-    private func publish() {
-        let processedText = self.chunks.joined()
-        NotchOverlayManager.shared.updateTranscriptionText(processedText)
+    static func notificationMessage(for error: Error) -> String {
+        if let aiError = error as? AIProcessingError, aiError.isConfigurationError {
+            return "\(aiError.localizedDescription). Open AI Providers to configure a provider."
+        }
+        return error.localizedDescription
     }
 }
 
-// MARK: - Sidebar Item Enum
+nonisolated enum DictationStreamingFallbackPolicy {
+    static func shouldRetryWithoutStreaming(after error: Error) -> Bool {
+        if error is CancellationError || error is URLError {
+            return false
+        }
+        guard let llmError = error as? LLMError else { return true }
+        switch llmError {
+        case .networkError, .timeout, .invalidURL, .encodingError, .invalidRequest:
+            return false
+        case .invalidResponse, .httpError:
+            return true
+        }
+    }
+}
 
-enum SidebarItem: Hashable {
-    case welcome
-    case voiceEngine
-    case aiEnhancements
-    case preferences
-    case meetingTools
-    case customDictionary
-    case stats
-    case history
-    case changelog
-    case feedback
-    case commandMode
-    case rewriteMode
+final nonisolated class DictationAIStreamPreviewBuffer: @unchecked Sendable {
+    typealias Publisher = @MainActor @Sendable (String) -> Void
+
+    private let lock = NSLock()
+    private let minimumUpdateInterval: TimeInterval
+    private let publisher: Publisher
+    private var bufferedText = ""
+    private var lastPublishedText = ""
+    private var nextEligibleUIUpdate: TimeInterval
+    private var isUIUpdateScheduled = false
+
+    init(
+        minimumUpdateInterval: TimeInterval = 0.033,
+        initialUpdateDelay: TimeInterval = 0.5,
+        publisher: @escaping Publisher = { text in
+            NotchOverlayManager.shared.updateTranscriptionText(text)
+        }
+    ) {
+        self.minimumUpdateInterval = minimumUpdateInterval
+        self.nextEligibleUIUpdate = ProcessInfo.processInfo.systemUptime + initialUpdateDelay
+        self.publisher = publisher
+    }
+
+    func append(_ chunk: String) {
+        guard !chunk.isEmpty else { return }
+        let shouldSchedule = self.lock.withLock {
+            self.bufferedText += chunk
+            guard !self.isUIUpdateScheduled,
+                  ProcessInfo.processInfo.systemUptime >= self.nextEligibleUIUpdate
+            else {
+                return false
+            }
+            self.isUIUpdateScheduled = true
+            return true
+        }
+        guard shouldSchedule else { return }
+
+        Task { @MainActor [weak self] in
+            self?.publishScheduledUpdate()
+        }
+    }
+
+    @MainActor
+    func flush() {
+        guard let text = self.takeTextForPublishing(requiresScheduledUpdate: false) else { return }
+        self.publisher(text)
+    }
+
+    @MainActor
+    private func publishScheduledUpdate() {
+        guard let text = self.takeTextForPublishing(requiresScheduledUpdate: true) else { return }
+        self.publisher(text)
+    }
+
+    private func takeTextForPublishing(requiresScheduledUpdate: Bool) -> String? {
+        self.lock.withLock {
+            if requiresScheduledUpdate, !self.isUIUpdateScheduled {
+                return nil
+            }
+            self.isUIUpdateScheduled = false
+            self.nextEligibleUIUpdate = ProcessInfo.processInfo.systemUptime + self.minimumUpdateInterval
+            guard self.bufferedText != self.lastPublishedText else { return nil }
+            self.lastPublishedText = self.bufferedText
+            return self.bufferedText
+        }
+    }
 }
 
 enum PrimaryDictationShortcutEdit: Hashable {
@@ -178,6 +231,8 @@ enum ShortcutRecordingTarget: Hashable {
 
 // swiftlint:disable type_body_length file_length
 struct ContentView: View {
+    private static let aiProcessingStatusDelayNanoseconds: UInt64 = 500_000_000
+
     private enum ActiveRecordingMode: String {
         case none
         case dictate
@@ -210,6 +265,7 @@ struct ContentView: View {
     }
 
     @Environment(\.theme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @State private var hotkeyManager: GlobalHotkeyManager? = nil
     @State private var hotkeyManagerInitialized: Bool = false
 
@@ -243,6 +299,13 @@ struct ContentView: View {
 
     @State private var selectedSidebarItem: SidebarItem?
     @State private var previousSidebarItem: SidebarItem? = nil // Track previous for mode transitions
+    @State private var settingsNavigation = SettingsNavigationState()
+    @State private var settingsSearchQuery = ""
+    @State private var settingsSearchScrollRequest = 0
+
+    @State private var isHelpEntryHovered = false
+    @State private var isSettingsEntryHovered = false
+    @State private var isSettingsBackHovered = false
     @State private var playgroundUsed: Bool = SettingsStore.shared.playgroundUsed
     @State private var recordingAppInfo: (name: String, bundleId: String, windowTitle: String)? = nil
     @State private var recordingTargetProcessID: pid_t? = nil
@@ -320,7 +383,6 @@ struct ContentView: View {
     @State private var savedProviders: [SettingsStore.SavedProvider] = []
     @State private var selectedProviderID: String = SettingsStore.shared.selectedProviderID
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var microphoneSettingsScrollRequest = 0
 
     var body: some View {
         let layout = AnyView(
@@ -329,7 +391,7 @@ struct ContentView: View {
                     self.onboardingOnlyView
                 } else {
                     NavigationSplitView(columnVisibility: self.$columnVisibility) {
-                        self.sidebarView
+                        self.sidebarContent
                             .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 300)
                     } detail: {
                         self.detailView
@@ -353,7 +415,7 @@ struct ContentView: View {
                 self.refreshAccessibilityPermissionState()
             }
             .onReceive(NotificationCenter.default.publisher(for: .openCustomDictionaryFromVoiceEngine)) { _ in
-                self.selectedSidebarItem = .customDictionary
+                self.navigateToApp(.customDictionary)
             }
             .onReceive(NotificationCenter.default.publisher(for: .appNavigationRequested)) { _ in
                 self.handlePendingAppNavigation()
@@ -486,8 +548,8 @@ struct ContentView: View {
                 self.handleRewriteShortcutEnabledChange(newValue)
             }
             .onChange(of: self.pasteLastTranscriptionHotkeyShortcut) { _, newValue in
-                // The hotkey manager reads this value live from SettingsStore, so persisting is enough.
                 SettingsStore.shared.pasteLastTranscriptionHotkeyShortcut = newValue
+                self.hotkeyManager?.refreshMouseShortcutTapIfNeeded()
             }
             .onChange(of: self.isPasteLastTranscriptionShortcutEnabled) { newValue in
                 self.handlePasteLastTranscriptionShortcutEnabledChange(newValue)
@@ -496,6 +558,7 @@ struct ContentView: View {
 
     private func handlePasteLastTranscriptionShortcutEnabledChange(_ isEnabled: Bool) {
         SettingsStore.shared.pasteLastTranscriptionShortcutEnabled = isEnabled
+        self.hotkeyManager?.refreshMouseShortcutTapIfNeeded()
         if !isEnabled, self.activeShortcutRecordingTarget == .pasteLast {
             self.clearShortcutRecordingMode()
         }
@@ -580,9 +643,8 @@ struct ContentView: View {
             self.finishAccessibilityPermissionFlow()
         }
 
-        if self.selectedSidebarItem == nil {
-            let isOnboarded = self.asr.isAsrReady || self.asr.modelsExistOnDisk
-            self.selectedSidebarItem = isOnboarded ? .preferences : .welcome
+        if self.selectedSidebarItem == nil, !self.settingsNavigation.isPresented {
+            self.selectedSidebarItem = .welcome
         }
         self.handlePendingAppNavigation()
 
@@ -918,11 +980,35 @@ struct ContentView: View {
         )
     }
 
+    private func recordDictationUsage(
+        shouldUseAI: Bool,
+        dictationSlot: SettingsStore.DictationShortcutSlot?,
+        appBundleID: String
+    ) -> (provider: String?, model: String?) {
+        let postProcessing = self.currentDictationAIModelInfo(
+            dictationSlot: dictationSlot,
+            appBundleID: appBundleID
+        )
+        AnalyticsService.shared.recordUsage(
+            mode: .dictation,
+            transcriptionModel: self.settings.selectedSpeechModel.analyticsDescriptor,
+            aiModel: shouldUseAI ? AnalyticsModelDescriptor(
+                provider: postProcessing.provider ?? "unknown",
+                model: postProcessing.model ?? "unknown"
+            ) : nil
+        )
+        return postProcessing
+    }
+
     // MARK: - Mode Transition Handler
 
     /// Centralized handler for sidebar mode transitions to ensure proper cleanup and state management
     private func handleModeTransition(from oldValue: SidebarItem?, to newValue: SidebarItem?) {
         DebugLogger.shared.debug("Mode transition: \(String(describing: oldValue)) → \(String(describing: newValue))", source: "ContentView")
+
+        if oldValue != newValue {
+            self.clearShortcutRecordingMode()
+        }
 
         // Clean up state from the previous mode
         if let old = oldValue {
@@ -970,12 +1056,11 @@ struct ContentView: View {
 
         switch destination {
         case .customDictionary:
-            self.selectedSidebarItem = .customDictionary
+            self.navigateToApp(.customDictionary)
         case .microphoneSettings:
-            self.selectedSidebarItem = .preferences
-            self.microphoneSettingsScrollRequest &+= 1
-        case .preferences:
-            self.selectedSidebarItem = .preferences
+            self.openSettings(.audio)
+        case .settings:
+            self.openSettings(.general)
         }
     }
 
@@ -984,10 +1069,34 @@ struct ContentView: View {
 
         switch destination {
         case .aiEnhancements:
-            self.selectedSidebarItem = .aiEnhancements
+            self.navigateToApp(.aiEnhancements)
         case .history:
-            self.selectedSidebarItem = .history
+            self.navigateToApp(.history)
         }
+    }
+
+    private func navigateToApp(_ destination: SidebarItem) {
+        self.clearShortcutRecordingMode()
+        self.resetSettingsSearch()
+        self.settingsNavigation.leaveForApp()
+        self.selectedSidebarItem = destination
+    }
+
+    private func openSettings(_ section: SettingsSection) {
+        self.clearShortcutRecordingMode()
+        self.resetSettingsSearch()
+        self.settingsNavigation.present(section, returningTo: self.selectedSidebarItem)
+    }
+
+    private func closeSettings() {
+        self.clearShortcutRecordingMode()
+        self.resetSettingsSearch()
+        self.selectedSidebarItem = self.settingsNavigation.dismiss()
+    }
+
+    private func resetSettingsSearch() {
+        self.settingsSearchQuery = ""
+        self.settingsSearchScrollRequest += 1
     }
 
     private func resetPendingShortcutState() {
@@ -1169,12 +1278,39 @@ struct ContentView: View {
         NSWorkspace.shared.open(url)
     }
 
-    private var sidebarView: some View {
+    private func openHelpDocumentation() {
+        guard let url = URL(string: "https://docs.altic.dev/") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private var sidebarContent: some View {
+        ZStack {
+            // Keep both sidebars mounted so navigation feedback never waits on view construction.
+            self.appSidebarView
+                .opacity(self.settingsNavigation.isPresented ? 0 : 1)
+                .offset(x: self.settingsNavigation.isPresented ? -self.sidebarTransitionDistance : 0)
+                .allowsHitTesting(!self.settingsNavigation.isPresented)
+                .accessibilityHidden(self.settingsNavigation.isPresented)
+
+            self.settingsSidebarView
+                .background(self.theme.palette.sidebarBackground)
+                .opacity(self.settingsNavigation.isPresented ? 1 : 0)
+                .offset(x: self.settingsNavigation.isPresented ? 0 : self.sidebarTransitionDistance)
+                .allowsHitTesting(self.settingsNavigation.isPresented)
+                .accessibilityHidden(!self.settingsNavigation.isPresented)
+        }
+        .clipped()
+        .navigationTitle(self.settingsNavigation.isPresented ? "Settings" : "FluidVoice")
+        .tint(self.theme.palette.accent)
+        .animation(self.modeTransitionAnimation, value: self.settingsNavigation.isPresented)
+    }
+
+    private var appSidebarView: some View {
         List(selection: self.$selectedSidebarItem) {
             Section {
-                self.sidebarNavigationLink(.preferences, title: "Settings", systemImage: "gearshape.fill")
                 self.sidebarNavigationLink(.voiceEngine, title: "Voice Engine", systemImage: "waveform")
-                self.sidebarNavigationLink(.aiEnhancements, title: "AI Enhancement", systemImage: "brain")
+                self.sidebarNavigationLink(.aiEnhancements, title: "AI Providers", systemImage: "cpu")
+                self.sidebarNavigationLink(.cleanupStyles, title: "Cleanup Styles", systemImage: "wand.and.stars")
                 self.sidebarNavigationLink(.customDictionary, title: "Custom Dictionary", systemImage: "text.book.closed.fill")
             } header: {
                 self.sidebarSectionHeader("Configure")
@@ -1203,9 +1339,213 @@ struct ContentView: View {
             }
         }
         .listStyle(.sidebar)
+        .accentColor(self.theme.palette.accent)
         .animation(nil, value: self.selectedSidebarItem)
-        .navigationTitle("FluidVoice")
-        .tint(self.theme.palette.accent)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                self.helpEntryButton
+                self.settingsEntryButton
+            }
+        }
+    }
+
+    private var settingsSidebarView: some View {
+        VStack(spacing: 0) {
+            Button {
+                self.closeSettings()
+            } label: {
+                HStack(spacing: self.theme.metrics.spacing.sm) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 18, height: 28)
+
+                    Text("Back to app")
+                        .font(self.theme.typography.sidebarItem)
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, self.theme.metrics.spacing.md)
+                .padding(.top, self.theme.metrics.spacing.sm)
+                .padding(.bottom, self.theme.metrics.spacing.xs)
+                .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(SidebarChromeButtonStyle(
+                isHovered: self.isSettingsBackHovered,
+                reduceMotion: self.accessibilityReduceMotion
+            ))
+            .onHover { self.isSettingsBackHovered = $0 }
+            .help("Back to FluidVoice")
+            .accessibilityLabel("Back to FluidVoice")
+
+            SettingsSearchField(text: Binding(
+                get: { self.settingsSearchQuery },
+                set: { self.updateSettingsSearchQuery($0) }
+            ), isActive: self.settingsNavigation.isPresented)
+                .frame(height: 24)
+                .padding(.horizontal, self.theme.metrics.spacing.md)
+                .padding(.top, self.theme.metrics.spacing.xs)
+                .padding(.bottom, self.theme.metrics.spacing.sm)
+
+            List(selection: Binding(
+                get: { self.settingsNavigation.selectedSection },
+                set: { newValue in
+                    guard let newValue else { return }
+                    if self.settingsNavigation.isLeaving(.dictation, for: newValue) {
+                        self.clearShortcutRecordingMode()
+                    }
+                    self.settingsNavigation.selectedSection = newValue
+                    self.settingsSearchScrollRequest += 1
+                }
+            )) {
+                ForEach(self.filteredSettingsSections) { section in
+                    let isSelected = self.settingsNavigation.selectedSection == section
+                    NavigationLink(value: section) {
+                        HStack(spacing: self.theme.metrics.spacing.sm) {
+                            Image(systemName: section.systemImage)
+                                .symbolRenderingMode(.hierarchical)
+                                .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.secondary)
+                                .frame(width: 18)
+
+                            Text(section.title)
+                                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                        }
+                        .font(self.theme.typography.sidebarItem)
+                    }
+                    .sidebarOptionHover(
+                        isSelected: isSelected,
+                        reduceMotion: self.accessibilityReduceMotion
+                    )
+                }
+            }
+            .listStyle(.sidebar)
+            .accentColor(self.theme.palette.accent)
+            .animation(nil, value: self.settingsNavigation.selectedSection)
+        }
+    }
+
+    private var isSettingsSearchActive: Bool {
+        !self.settingsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var settingsSearchResults: [SettingsSearchResult] {
+        self.availableSettingsSearchResults(for: self.settingsSearchQuery)
+    }
+
+    private var filteredSettingsSections: [SettingsSection] {
+        guard self.isSettingsSearchActive else { return SettingsSection.allCases }
+        let matchingSections = Set(self.settingsSearchResults.map(\.section))
+        return SettingsSection.allCases.filter(matchingSections.contains)
+    }
+
+    private func updateSettingsSearchQuery(_ query: String) {
+        self.settingsSearchQuery = query
+        self.settingsSearchScrollRequest += 1
+
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let results = self.availableSettingsSearchResults(for: query)
+        self.settingsNavigation.selectedSection = SettingsSearchIndex.preferredSection(
+            current: self.settingsNavigation.selectedSection,
+            results: results
+        )
+    }
+
+    private func availableSettingsSearchResults(for query: String) -> [SettingsSearchResult] {
+        SettingsSearchIndex.results(for: query)
+            .filter { self.isSettingsSearchTargetAvailable($0.target) }
+    }
+
+    private func isSettingsSearchTargetAvailable(_ target: SettingsSearchTarget) -> Bool {
+        switch target {
+        case .microphonePermission:
+            return self.asr.micStatus != .authorized
+        case .accessibilityPermission:
+            return !self.accessibilityEnabled
+        case .audioStorage:
+            return SettingsStore.shared.saveTranscriptionHistory &&
+                SettingsStore.shared.saveAudioWithTranscriptionHistory
+        case .bottomOffset:
+            return self.settings.overlayPosition == .bottom
+        default:
+            return true
+        }
+    }
+
+    private var settingsEntryButton: some View {
+        Button {
+            self.openSettings(.general)
+        } label: {
+            HStack(spacing: self.theme.metrics.spacing.sm) {
+                Image(systemName: "gearshape")
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+
+                Text("Settings")
+
+                Spacer(minLength: self.theme.metrics.spacing.sm)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .font(self.theme.typography.sidebarItem)
+            .padding(.horizontal, self.theme.metrics.spacing.md)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SidebarChromeButtonStyle(
+            isHovered: self.isSettingsEntryHovered,
+            reduceMotion: self.accessibilityReduceMotion
+        ))
+        .onHover { self.isSettingsEntryHovered = $0 }
+        .help("Settings")
+        .accessibilityLabel("Settings")
+    }
+
+    private var helpEntryButton: some View {
+        Button {
+            self.openHelpDocumentation()
+        } label: {
+            HStack(spacing: self.theme.metrics.spacing.sm) {
+                Image(systemName: "questionmark.circle")
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+
+                Text("Help")
+
+                Spacer(minLength: self.theme.metrics.spacing.sm)
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .font(self.theme.typography.sidebarItem)
+            .padding(.horizontal, self.theme.metrics.spacing.md)
+            .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SidebarChromeButtonStyle(
+            isHovered: self.isHelpEntryHovered,
+            reduceMotion: self.accessibilityReduceMotion
+        ))
+        .onHover { self.isHelpEntryHovered = $0 }
+        .help("Open FluidVoice Help")
+        .accessibilityLabel("Help")
+        .accessibilityHint("Opens FluidVoice documentation in your default browser")
+    }
+
+    private var modeTransitionAnimation: Animation {
+        let duration = self.settingsNavigation.isPresented ? 0.16 : 0.1
+        return self.accessibilityReduceMotion
+            ? .easeOut(duration: 0.08)
+            : .snappy(duration: duration, extraBounce: 0)
+    }
+
+    private var sidebarTransitionDistance: CGFloat {
+        self.accessibilityReduceMotion ? 0 : 8
     }
 
     private func sidebarSectionHeader(_ title: String) -> some View {
@@ -1218,12 +1558,27 @@ struct ContentView: View {
     }
 
     private func sidebarNavigationLink(_ item: SidebarItem, title: String, systemImage: String) -> some View {
-        NavigationLink(value: item) {
-            Label(title, systemImage: systemImage)
-                .font(self.theme.typography.sidebarItem)
-                .frame(minHeight: 24, alignment: .leading)
-                .padding(.vertical, self.theme.metrics.spacing.xs / 2)
+        let isSelected = self.selectedSidebarItem == item
+        return NavigationLink(value: item) {
+            HStack(spacing: self.theme.metrics.spacing.sm) {
+                Image(nsImage: SidebarSymbolCache.image(named: systemImage))
+                    .renderingMode(.template)
+                    .resizable()
+                    .scaledToFit()
+                    .foregroundStyle(isSelected ? Color.white.opacity(0.9) : Color.secondary)
+                    .frame(width: 16, height: 16)
+                    .accessibilityHidden(true)
+
+                Text(title)
+                    .foregroundStyle(isSelected ? Color.white : Color.primary)
+            }
+            .font(self.theme.typography.sidebarItem)
+            .padding(.vertical, self.theme.metrics.spacing.xs / 2)
         }
+        .sidebarOptionHover(
+            isSelected: isSelected,
+            reduceMotion: self.accessibilityReduceMotion
+        )
     }
 
     private var themePreferenceButton: some View {
@@ -1246,7 +1601,7 @@ struct ContentView: View {
 
     private var todayStatsButton: some View {
         TodayStatsToolbarButton(typingWPM: self.settings.userTypingWPM) {
-            self.selectedSidebarItem = .stats
+            self.navigateToApp(.stats)
         }
     }
 
@@ -1255,14 +1610,29 @@ struct ContentView: View {
             Color(nsColor: .windowBackgroundColor)
                 .ignoresSafeArea()
 
-            self.detailContent
-                .transaction { transaction in
-                    transaction.animation = nil
-                }
+            // Preserve the app destination so Back never waits on expensive detail initialization.
+            self.appDetailContent
+                .opacity(self.settingsNavigation.isPresented ? 0 : 1)
+                .offset(x: self.settingsNavigation.isPresented ? -6 : 0)
+                .allowsHitTesting(!self.settingsNavigation.isPresented)
+                .accessibilityHidden(self.settingsNavigation.isPresented)
+
+            if self.settingsNavigation.isPresented {
+                self.preferencesView
+                    .transition(self.settingsDetailTransition)
+            }
         }
+        .animation(self.modeTransitionAnimation, value: self.settingsNavigation.isPresented)
     }
 
-    private var detailContent: AnyView {
+    private var settingsDetailTransition: AnyTransition {
+        if self.accessibilityReduceMotion {
+            return .opacity
+        }
+        return .offset(x: 8).combined(with: .opacity)
+    }
+
+    private var appDetailContent: AnyView {
         switch self.selectedSidebarItem ?? .welcome {
         case .welcome:
             return AnyView(self.welcomeView)
@@ -1271,15 +1641,14 @@ struct ContentView: View {
                 appServices: self.appServices,
                 theme: self.theme
             ))
-        case .aiEnhancements:
+        case .aiEnhancements, .cleanupStyles:
             return AnyView(AIEnhancementSettingsScreen(
                 menuBarManager: self.menuBarManager,
                 theme: self.theme,
+                selectedConfigurationSection: self.aiEnhancementConfigurationSectionBinding,
                 activeShortcutRecordingTarget: self.$activeShortcutRecordingTarget,
                 shortcutRecordingMessage: self.$shortcutRecordingMessage
             ))
-        case .preferences:
-            return AnyView(self.preferencesView)
         case .meetingTools:
             return AnyView(self.meetingToolsView)
         case .customDictionary:
@@ -1297,6 +1666,18 @@ struct ContentView: View {
         case .history:
             return AnyView(TranscriptionHistoryView())
         }
+    }
+
+    private var aiEnhancementConfigurationSectionBinding: Binding<AIEnhancementConfigurationSection> {
+        Binding(
+            get: {
+                self.selectedSidebarItem?.aiEnhancementConfigurationSection ?? .providers
+            },
+            set: { section in
+                guard self.selectedSidebarItem != section.sidebarItem else { return }
+                self.navigateToApp(section.sidebarItem)
+            }
+        )
     }
 
     private var onboardingOnlyView: some View {
@@ -1460,40 +1841,53 @@ struct ContentView: View {
 
     // MARK: - Preferences View
 
+    @ViewBuilder
     private var preferencesView: some View {
-        SettingsView(
-            microphonePreferenceCoordinator: self.appServices.microphonePreferenceCoordinator,
-            appear: self.$appear,
-            visualizerNoiseThreshold: self.$visualizerNoiseThreshold,
-            selectedInputUID: self.$selectedInputUID,
-            selectedOutputUID: self.$selectedOutputUID,
-            inputDevices: self.$inputDevices,
-            outputDevices: self.$outputDevices,
-            accessibilityEnabled: self.$accessibilityEnabled,
-            primaryDictationShortcuts: self.$primaryDictationShortcuts,
-            activeShortcutRecordingTarget: self.$activeShortcutRecordingTarget,
-            shortcutRecordingMessage: self.$shortcutRecordingMessage,
-            commandModeShortcut: self.$commandModeHotkeyShortcut,
-            rewriteShortcut: self.$rewriteModeHotkeyShortcut,
-            cancelRecordingShortcut: self.$cancelRecordingHotkeyShortcut,
-            pasteLastTranscriptionShortcut: self.$pasteLastTranscriptionHotkeyShortcut,
-            commandModeShortcutEnabled: self.$isCommandModeShortcutEnabled,
-            rewriteShortcutEnabled: self.$isRewriteModeShortcutEnabled,
-            pasteLastTranscriptionShortcutEnabled: self.$isPasteLastTranscriptionShortcutEnabled,
-            hotkeyManagerInitialized: self.$hotkeyManagerInitialized,
-            hotkeyMode: self.$hotkeyMode,
-            enableStreamingPreview: self.$enableStreamingPreview,
-            copyToClipboard: self.$copyToClipboard,
-            hotkeyManager: self.hotkeyManager,
-            menuBarManager: self.menuBarManager,
-            startRecording: self.startRecording,
-            refreshDevices: self.refreshDevices,
-            openAccessibilitySettings: self.openAccessibilitySettings,
-            restartApp: self.restartApp,
-            revealAppInFinder: self.revealAppInFinder,
-            openApplicationsFolder: self.openApplicationsFolder,
-            microphoneSettingsScrollRequest: self.microphoneSettingsScrollRequest
-        )
+        if self.isSettingsSearchActive, self.settingsSearchResults.isEmpty {
+            ContentUnavailableView {
+                Label("No Settings Found", systemImage: "magnifyingglass")
+            } description: {
+                Text("No settings match “\(self.settingsSearchQuery)”.")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityElement(children: .combine)
+        } else {
+            SettingsView(
+                selectedSection: self.settingsNavigation.selectedSection ?? .general,
+                searchResults: self.settingsSearchResults,
+                searchScrollRequest: self.settingsSearchScrollRequest,
+                microphonePreferenceCoordinator: self.appServices.microphonePreferenceCoordinator,
+                appear: self.$appear,
+                visualizerNoiseThreshold: self.$visualizerNoiseThreshold,
+                selectedInputUID: self.$selectedInputUID,
+                selectedOutputUID: self.$selectedOutputUID,
+                inputDevices: self.$inputDevices,
+                outputDevices: self.$outputDevices,
+                accessibilityEnabled: self.$accessibilityEnabled,
+                primaryDictationShortcuts: self.$primaryDictationShortcuts,
+                activeShortcutRecordingTarget: self.$activeShortcutRecordingTarget,
+                shortcutRecordingMessage: self.$shortcutRecordingMessage,
+                commandModeShortcut: self.$commandModeHotkeyShortcut,
+                rewriteShortcut: self.$rewriteModeHotkeyShortcut,
+                cancelRecordingShortcut: self.$cancelRecordingHotkeyShortcut,
+                pasteLastTranscriptionShortcut: self.$pasteLastTranscriptionHotkeyShortcut,
+                commandModeShortcutEnabled: self.$isCommandModeShortcutEnabled,
+                rewriteShortcutEnabled: self.$isRewriteModeShortcutEnabled,
+                pasteLastTranscriptionShortcutEnabled: self.$isPasteLastTranscriptionShortcutEnabled,
+                hotkeyManagerInitialized: self.$hotkeyManagerInitialized,
+                hotkeyMode: self.$hotkeyMode,
+                enableStreamingPreview: self.$enableStreamingPreview,
+                copyToClipboard: self.$copyToClipboard,
+                hotkeyManager: self.hotkeyManager,
+                menuBarManager: self.menuBarManager,
+                startRecording: self.startRecording,
+                refreshDevices: self.refreshDevices,
+                openAccessibilitySettings: self.openAccessibilitySettings,
+                restartApp: self.restartApp,
+                revealAppInFinder: self.revealAppInFinder,
+                openApplicationsFolder: self.openApplicationsFolder
+            )
+        }
     }
 
     private var recordingView: some View {
@@ -1505,16 +1899,18 @@ struct ContentView: View {
     }
 
     private var commandModeView: some View {
-        CommandModeView(service: self.commandModeService, onClose: {
-            let isOnboarded = self.asr.isAsrReady || self.asr.modelsExistOnDisk
-            self.selectedSidebarItem = isOnboarded ? .preferences : .welcome
-        })
+        CommandModeView(
+            service: self.commandModeService,
+            isActive: !self.settingsNavigation.isPresented,
+            onClose: {
+                self.navigateToApp(.welcome)
+            }
+        )
     }
 
     private var rewriteModeView: some View {
         RewriteModeView(service: self.rewriteModeService, onClose: {
-            let isOnboarded = self.asr.isAsrReady || self.asr.modelsExistOnDisk
-            self.selectedSidebarItem = isOnboarded ? .preferences : .welcome
+            self.navigateToApp(.welcome)
         })
     }
 
@@ -1851,23 +2247,61 @@ struct ContentView: View {
 
     // MARK: - Modular AI Processing
 
-    private struct AIProcessingOutcome {
+    private struct AITextProcessingResult {
         let text: String
+        let tokensPerSecond: Double?
+        let fluidIntelligenceLatencyMilliseconds: Int?
         let promptSnapshot: String?
     }
 
     private func processTextWithAI(
         _ inputText: String,
         overrideSystemPrompt: String? = nil,
+        overrideProviderID: String? = nil,
+        overrideModel: String? = nil,
         dictationSlot: SettingsStore.DictationShortcutSlot? = nil,
-        streamHandler: PrivateAIStreamHandler? = nil
-    ) async throws -> AIProcessingOutcome {
-        self.lastAIPromptSnapshot = nil
-        let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
-        let route = DictationProviderRoute.resolve(
-            settings: SettingsStore.shared,
+        streamHandler: PrivateAIStreamHandler? = nil,
+        benchmarkID: String? = nil
+    ) async throws -> String {
+        try await self.processTextWithAIMetrics(
+            inputText,
+            overrideSystemPrompt: overrideSystemPrompt,
+            overrideProviderID: overrideProviderID,
+            overrideModel: overrideModel,
             dictationSlot: dictationSlot,
-            appBundleID: appInfo.bundleId
+            streamHandler: streamHandler,
+            benchmarkID: benchmarkID
+        ).text
+    }
+
+    private func processTextWithAIMetrics(
+        _ inputText: String,
+        overrideSystemPrompt: String? = nil,
+        overrideProviderID: String? = nil,
+        overrideModel: String? = nil,
+        dictationSlot: SettingsStore.DictationShortcutSlot? = nil,
+        streamHandler: PrivateAIStreamHandler? = nil,
+        benchmarkID: String? = nil
+    ) async throws -> AITextProcessingResult {
+        self.lastAIPromptSnapshot = nil
+        let routeStartedAt = ProcessInfo.processInfo.systemUptime
+        let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
+        let route: DictationProviderRoute
+        if let overrideProviderID, let overrideModel {
+            route = DictationProviderRoute.resolve(
+                settings: SettingsStore.shared,
+                providerID: overrideProviderID,
+                model: overrideModel
+            )
+        } else {
+            route = DictationProviderRoute.resolve(
+                settings: SettingsStore.shared,
+                dictationSlot: dictationSlot,
+                appBundleID: appInfo.bundleId
+            )
+        }
+        self.appBench(
+            "ai_route_resolved elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - routeStartedAt) * 1000).rounded()))"
         )
         let currentSelectedProviderID = route.providerID
         let derivedCurrentProvider = route.providerKey
@@ -1921,6 +2355,8 @@ struct ContentView: View {
                 )
             }
 
+            self.appBench("ai_private_call")
+            let fluidIntelligenceStartedAt = ProcessInfo.processInfo.systemUptime
             let response = try await PrivateAIIntegrationService.shared.enhanceDictation(
                 inputText,
                 runtime: PrivateAIIntegrationService.RuntimeConfiguration(
@@ -1942,11 +2378,23 @@ struct ContentView: View {
                 ),
                 streamHandler: streamHandler
             )
+            self.appBench("ai_private_return")
 
             if self.shouldTracePromptProcessing {
                 self.logDictationPromptTrace("Model answer (A)", value: response.outputText)
             }
-            return AIProcessingOutcome(text: response.outputText, promptSnapshot: promptSnapshot)
+            let tokensPerSecond = response.tokensPerSecond.flatMap { value in
+                value.isFinite && value > 0 ? value : nil
+            }
+            let fluidIntelligenceLatencyMilliseconds = Int(
+                ((ProcessInfo.processInfo.systemUptime - fluidIntelligenceStartedAt) * 1000).rounded()
+            )
+            return AITextProcessingResult(
+                text: response.outputText,
+                tokensPerSecond: tokensPerSecond,
+                fluidIntelligenceLatencyMilliseconds: fluidIntelligenceLatencyMilliseconds,
+                promptSnapshot: promptSnapshot
+            )
         }
 
         // Resolve the effective prompt once so every provider path honors
@@ -2072,7 +2520,8 @@ struct ContentView: View {
             streaming: enableStreaming,
             tools: [],
             temperature: isTemperatureUnsupported ? nil : 0.2,
-            extraParameters: extraParams
+            extraParameters: extraParams,
+            benchmarkID: benchmarkID
         )
         if enableStreaming {
             config.onContentChunk = { chunk in
@@ -2087,6 +2536,11 @@ struct ContentView: View {
             do {
                 response = try await LLMClient.shared.call(config)
             } catch {
+                guard DictationStreamingFallbackPolicy.shouldRetryWithoutStreaming(after: error) else {
+                    self.appBench("ai_streaming_fallback_skipped reason=transport_or_cancel")
+                    throw error
+                }
+                self.appBench("ai_streaming_fallback_start")
                 DebugLogger.shared.warning(
                     "Streaming dictation post-processing failed; retrying without streaming: \(error.localizedDescription)",
                     source: "ContentView"
@@ -2099,7 +2553,8 @@ struct ContentView: View {
                     streaming: false,
                     tools: [],
                     temperature: isTemperatureUnsupported ? nil : 0.2,
-                    extraParameters: extraParams
+                    extraParameters: extraParams,
+                    benchmarkID: benchmarkID
                 )
                 response = try await LLMClient.shared.call(fallbackConfig)
             }
@@ -2122,7 +2577,12 @@ struct ContentView: View {
         guard !response.content.isEmpty else {
             throw AIProcessingError.emptyResponse
         }
-        return AIProcessingOutcome(text: response.content, promptSnapshot: promptSnapshot)
+        return AITextProcessingResult(
+            text: response.content,
+            tokensPerSecond: nil,
+            fluidIntelligenceLatencyMilliseconds: nil,
+            promptSnapshot: promptSnapshot
+        )
     }
 
     // MARK: - Streaming Response Handler (DEPRECATED - Now handled by LLMClient)
@@ -2132,7 +2592,19 @@ struct ContentView: View {
     // MARK: - Stop and Process Transcription
 
     private func stopAndProcessTranscription(route: DictationOutputRoute = .normal) async {
-        DebugLogger.shared.debug("stopAndProcessTranscription called", source: "ContentView")
+        let pipelineID = UUID().uuidString
+        await DebugLogger.$pipelineID.withValue(pipelineID) {
+            await self.processStoppedTranscription(route: route, pipelineID: pipelineID)
+        }
+    }
+
+    private func processStoppedTranscription(route: DictationOutputRoute, pipelineID: String) async {
+        let pipelineStartedAt = ProcessInfo.processInfo.systemUptime
+        let expectedOverlayLifecycleID = self.overlayLifecycleID
+        self.appBench("pipeline_begin id=\(pipelineID) route=\(route.rawValue)")
+        defer {
+            self.appBench("pipeline_handler_return id=\(pipelineID) elapsedMs=\((ProcessInfo.processInfo.systemUptime - pipelineStartedAt) * 1000) deliveryMayBePending=true")
+        }
         DebugLogger.shared.info("Output route selected: \(route.rawValue)", source: "ContentView")
         self.appBench("stop_path_enter route=\(route.rawValue)")
         let isOnboardingTryout = route == .onboardingSandbox && self.isOnboardingVoicePlaygroundStepActive
@@ -2153,30 +2625,15 @@ struct ContentView: View {
             !promptTest.isActive &&
             !shouldUseAIOnStop &&
             !self.settings.spokenSendEnabled
-        var didRequestOverlayHideOnStop = false
         DebugLogger.shared.info(
             "Routing decision snapshot | activeMode=\(modeAtStop.rawValue) | rewrite=\(wasRewriteMode) | command=\(wasCommandMode) | overlay=\(NotchContentState.shared.mode.rawValue)",
             source: "ContentView"
         )
 
         self.clearActiveRecordingMode()
-
-        if shouldHideOverlayOnStop {
-            didRequestOverlayHideOnStop = true
-            DebugLogger.shared.debug("Hiding dictation overlay at stop path", source: "ContentView")
-            self.hideOverlayAsync(reason: "stop_path")
-        } else {
-            // Show "Transcribing" state before calling stop() when the overlay needs
-            // to remain available for prompt, command, rewrite, or AI feedback.
-            DebugLogger.shared.debug("Showing transcription processing state", source: "ContentView")
-            self.appBench("processing_ui_request status=Transcribing")
-            self.menuBarManager.setProcessing(true)
-            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
-            self.appBench("processing_ui_requested status=Transcribing")
-
-            // Give SwiftUI a chance to render the processing state before heavier work.
-            await Task.yield()
-        }
+        let stopOverlay = self.prepareOverlayForASRStop(shouldHideOverlayOnStop: shouldHideOverlayOnStop)
+        let stopUIInvalidationHold = self.holdStopUIInvalidation(whileProcessing: !stopOverlay.didRequestHide)
+        defer { self.releaseStopUIInvalidation(stopUIInvalidationHold) }
 
         // Stop the ASR service and wait for transcription to complete
         // The processing indicator will stay visible during this phase
@@ -2185,20 +2642,24 @@ struct ContentView: View {
         // Play the stop cue as soon as the audio engine has stopped, before the
         // (potentially slow) final transcription pass. Scoped to dictation only —
         // Command/Edit modes call asr.stop() without this callback.
-        let transcribedText = await asr.stop(onCaptureStopped: {
-            TranscriptionSoundPlayer.shared.playStopSound()
-        })
+        let transcribedText = await asr.stop(
+            onCaptureStopped: {
+                TranscriptionSoundPlayer.shared.playStopSound()
+            },
+            onFinalTranscriptionStarted: stopOverlay.onFinalTranscriptionStarted
+        )
         self.appBench("asr_stop_return elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - asrStopStartedAt) * 1000).rounded()))")
         let audioSnapshot = self.asr.consumeLastCompletedAudioSnapshot()
+        let transcriptionDurationMilliseconds = self.asr.consumeLastFinalTranscriptionDurationMs()
         DebugLogger.shared.info(
             "Stop transcription result | chars=\(transcribedText.count) | empty=\(transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
             source: "ContentView"
         )
 
-        // Reset the transcription text display after transcription completes
-        NotchOverlayManager.shared.updateTranscriptionText("")
-
         guard transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            // Empty results have no delivery callback, so clear their stale
+            // preview before the existing empty-result dismissal path runs.
+            NotchOverlayManager.shared.updateTranscriptionText("")
             DebugLogger.shared.debug("Transcription returned empty text", source: "ContentView")
             if isOnboardingTryout {
                 if self.asr.lastStopOutcome == .failed {
@@ -2210,8 +2671,11 @@ struct ContentView: View {
                     AnalyticsService.shared.recordOnboardingTryoutAttemptResult(outcome: .empty)
                 }
             }
+            if route == .normal, !wasRewriteMode, !wasCommandMode, !promptTest.isActive {
+                self.recordEmptyDictationPerformance(startedAt: pipelineStartedAt, asrMs: transcriptionDurationMilliseconds)
+            }
             // Finish the same short exit transition even when no text is emitted.
-            if !didRequestOverlayHideOnStop {
+            if !stopOverlay.didRequestHide {
                 await self.menuBarManager.finishProcessingAndHideOverlay()
             }
             return
@@ -2219,37 +2683,7 @@ struct ContentView: View {
 
         // Prompt Test Mode: reroute dictation hotkey output into the prompt editor (no typing/clipboard/history).
         if promptTest.isActive {
-            promptTest.lastTranscriptionText = transcribedText
-            promptTest.lastOutputText = ""
-            promptTest.lastError = ""
-
-            guard DictationAIPostProcessingGate.isProviderConfigured() else {
-                promptTest.lastError = "AI post-processing is not configured. Configure a provider/model (and API key for non-local endpoints) to test prompts."
-                self.menuBarManager.setProcessing(false)
-                return
-            }
-
-            promptTest.isProcessing = true
-            // Processing already true from above
-            defer {
-                self.menuBarManager.setProcessing(false)
-                promptTest.isProcessing = false
-            }
-
-            do {
-                let result = try await self.processTextWithAI(transcribedText, overrideSystemPrompt: promptTest.draftPromptText)
-                let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
-                let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
-                    result.text,
-                    appName: appInfo.name,
-                    bundleID: appInfo.bundleId,
-                    windowTitle: appInfo.windowTitle
-                )
-                promptTest.lastOutputText = ASRService.applyGAAVFormatting(literalFormattedResult)
-            } catch {
-                DebugLogger.shared.error("Prompt test AI call failed: \(error.localizedDescription)", source: "ContentView")
-                promptTest.lastError = error.localizedDescription
-            }
+            await self.processDictationPromptTest(transcribedText)
             return
         }
 
@@ -2285,7 +2719,10 @@ struct ContentView: View {
         var finalText: String
         var aiFallbackReason: String?
         var postProcessingModel: String?
-        var aiEnhancementDurationMs: Int?
+        var aiProcessingDurationMilliseconds: Int?
+        var fluidIntelligenceDurationMilliseconds: Int?
+        var aiTokensPerSecond: Double?
+        var aiFallbackNotificationError: String?
         var aiPromptSnapshot: String?
         let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
         let punctuationFormattedText = ASRService.applySpokenPunctuationFormatting(
@@ -2308,51 +2745,46 @@ struct ContentView: View {
             DictationAIPostProcessingGate.isConfigured(for: $0, appBundleID: appInfo.bundleId)
         } ?? DictationAIPostProcessingGate.isConfigured(for: .primary, appBundleID: appInfo.bundleId))
         let transcriptionModelInfo = self.currentTranscriptionModelInfo()
-        let postProcessingModelInfo = self.currentDictationAIModelInfo(
+        let postProcessingModelInfo = self.recordDictationUsage(
+            shouldUseAI: shouldUseAI,
             dictationSlot: activeDictationSlot,
             appBundleID: appInfo.bundleId
-        )
-        AnalyticsService.shared.recordUsage(
-            mode: .dictation,
-            transcriptionModel: self.settings.selectedSpeechModel.analyticsDescriptor,
-            aiModel: shouldUseAI ? AnalyticsModelDescriptor(
-                provider: postProcessingModelInfo.provider ?? "unknown",
-                model: postProcessingModelInfo.model ?? "unknown"
-            ) : nil
         )
 
         if shouldUseAI {
             DebugLogger.shared.debug("Routing transcription through AI post-processing", source: "ContentView")
             postProcessingModel = postProcessingModelInfo.model
             let postProcessingInputChars = normalizedTranscribedText.count
-            let postProcessingStart = Date()
+            let postProcessingStart = ProcessInfo.processInfo.systemUptime
+            let processingFeedback = self.makeAIProcessingFeedback(lifecycleID: expectedOverlayLifecycleID)
+            let refiningStatusTask = processingFeedback.statusTask
+            defer { refiningStatusTask.cancel() }
 
-            // Update overlay text to show we're now refining (processing already true)
-            self.appBench("processing_ui_request status=Refining")
-            NotchOverlayManager.shared.updateTranscriptionText("Refining")
-            self.appBench("processing_ui_requested status=Refining")
-
-            // Ensure the status label becomes visible immediately.
-            await Task.yield()
-
-            let streamPreview = DictationAIStreamPreviewBuffer()
+            let streamPreview = processingFeedback.streamPreview
             let streamHandler: PrivateAIStreamHandler = { chunk in
-                Task { @MainActor in
-                    streamPreview.append(chunk)
-                }
+                streamPreview.append(chunk)
             }
 
             do {
-                let outcome = try await self.processTextWithAI(
+                self.logAIProcessCall(pipelineID, postProcessingModelInfo, postProcessingInputChars)
+                let result = try await self.processTextWithAIMetrics(
                     normalizedTranscribedText,
                     overrideSystemPrompt: promptOverride,
                     dictationSlot: activeDictationSlot,
-                    streamHandler: streamHandler
+                    streamHandler: streamHandler,
+                    benchmarkID: pipelineID
                 )
-                finalText = outcome.text
-                aiPromptSnapshot = outcome.promptSnapshot
-                await streamPreview.flush()
+                refiningStatusTask.cancel()
+                finalText = result.text
+                aiPromptSnapshot = result.promptSnapshot
+                self.appBench("ai_process_return id=\(pipelineID)")
+                aiTokensPerSecond = result.tokensPerSecond
+                fluidIntelligenceDurationMilliseconds = result.fluidIntelligenceLatencyMilliseconds
+                streamPreview.flush()
+                self.appBench("ai_preview_flushed id=\(pipelineID)")
             } catch {
+                refiningStatusTask.cancel()
+                self.appBench("ai_process_fail id=\(pipelineID)")
                 // Fall back to the raw transcription so the user still gets
                 // their words typed instead of an error string.
                 DebugLogger.shared.error(
@@ -2361,21 +2793,13 @@ struct ContentView: View {
                 )
                 aiFallbackReason = error.localizedDescription
                 aiPromptSnapshot = self.lastAIPromptSnapshot
-                // Configuration errors are actionable — point the user at settings
-                // rather than just echoing the technical error string.
-                if let aiError = error as? AIProcessingError,
-                   aiError.isConfigurationError
-                {
-                    NotificationService.showAIProcessingFallback(
-                        error: "\(aiError.localizedDescription). Open AI Enhancement settings to configure a provider."
-                    )
-                } else {
-                    NotificationService.showAIProcessingFallback(error: error.localizedDescription)
-                }
+                aiFallbackNotificationError = DictationAIFailurePresentationPolicy.notificationMessage(for: error)
                 finalText = normalizedTranscribedText
             }
-            let postProcessingLatencyMs = Int((Date().timeIntervalSince(postProcessingStart) * 1000).rounded())
-            aiEnhancementDurationMs = postProcessingLatencyMs
+            let postProcessingLatencyMs = Int(
+                ((ProcessInfo.processInfo.systemUptime - postProcessingStart) * 1000).rounded()
+            )
+            aiProcessingDurationMilliseconds = postProcessingLatencyMs
             let postProcessingProviderName = postProcessingModelInfo.provider ?? "unknown"
             let postProcessingModelName = postProcessingModelInfo.model ?? "unknown"
             DebugLogger.shared.info(
@@ -2384,10 +2808,6 @@ struct ContentView: View {
                     + "inputChars=\(postProcessingInputChars) fallback=\(aiFallbackReason != nil)",
                 source: "ContentView"
             )
-            // Clear transient status text before leaving processing state to avoid
-            // a brief non-shimmer "Refining..." preview flash.
-            NotchOverlayManager.shared.updateTranscriptionText("")
-
         } else {
             finalText = normalizedTranscribedText
         }
@@ -2428,6 +2848,15 @@ struct ContentView: View {
 
         DebugLogger.shared.info("Transcription finalized (chars: \(finalText.count))", source: "ContentView")
         let finalTextReadyAt = ProcessInfo.processInfo.systemUptime
+        self.recordCompletedDictationPerformance(
+            route: route,
+            pipelineStartedAt: pipelineStartedAt,
+            readyAt: finalTextReadyAt,
+            transcriptionDurationMilliseconds: transcriptionDurationMilliseconds,
+            aiProcessingDurationMilliseconds: aiProcessingDurationMilliseconds,
+            fluidIntelligenceDurationMilliseconds: fluidIntelligenceDurationMilliseconds,
+            outcome: aiFallbackReason == nil ? "success" : "ai_fallback"
+        )
         let finalOutputPlan = ASRService.makeDictationLiteralOutputPlan(
             for: finalText,
             appName: appInfo.name,
@@ -2436,6 +2865,7 @@ struct ContentView: View {
         )
         self.appBench("transcription_finalized chars=\(finalText.count)")
         self.appBench("text_ready chars=\(finalText.count)")
+        self.appBench("pipeline_text_ready id=\(pipelineID) stopToReadyMs=\((finalTextReadyAt - pipelineStartedAt) * 1000)")
 
         let shouldPersistOutputs = route == .normal
         if !shouldPersistOutputs {
@@ -2445,12 +2875,11 @@ struct ContentView: View {
             )
         }
 
-        let shouldShowAIProcessingFailure = shouldPersistOutputs && aiFallbackReason != nil
-        if shouldShowAIProcessingFailure {
-            self.pendingAIReprocessText = spokenSendParse.shouldSend ? normalizedTranscribedText : transcribedText
-            NotchContentState.shared.showAIProcessingFailure()
-            self.menuBarManager.finishProcessingKeepingOverlayVisible()
-        } else {
+        let shouldShowAIProcessingFailure = DictationAIFailurePresentationPolicy.shouldPresent(
+            shouldPersistOutputs: shouldPersistOutputs,
+            fallbackReason: aiFallbackReason
+        )
+        if !shouldShowAIProcessingFailure {
             self.pendingAIReprocessText = nil
         }
 
@@ -2471,8 +2900,11 @@ struct ContentView: View {
                 windowTitle: appInfo.windowTitle,
                 wasAIProcessed: postProcessingModel != nil && aiFallbackReason == nil,
                 processingModel: postProcessingModel,
-                aiEnhancementDurationMs: aiEnhancementDurationMs,
+                aiEnhancementDurationMs: aiProcessingDurationMilliseconds,
                 aiPromptSnapshot: aiPromptSnapshot,
+                transcriptionDurationMilliseconds: transcriptionDurationMilliseconds,
+                aiProcessingDurationMilliseconds: aiProcessingDurationMilliseconds,
+                aiTokensPerSecond: aiTokensPerSecond,
                 aiProcessingError: aiFallbackReason
             )
             self.persistDictationAudioIfNeeded(
@@ -2494,6 +2926,7 @@ struct ContentView: View {
         }
 
         var didTypeExternally = false
+        var didScheduleOverlayHideAfterDelivery = false
         let shouldTypeExternally = shouldPersistOutputs && !isFluidFrontmost
 
         DebugLogger.shared.debug(
@@ -2511,8 +2944,9 @@ struct ContentView: View {
                 && (sendsExistingDraft || !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 && targetMatchesRecordingFocus
                 && !self.isSpokenSendBlockedApp(appInfo)
-            // Dispatch insertion as soon as the destination app is ready; the
-            // overlay hides asynchronously after output so it cannot delay paste.
+            // Submit insertion first, then retire the overlay in this same main
+            // turn. The worker can paste concurrently; dismissal must not queue
+            // behind history notifications or a subsequent SwiftUI render.
             if typingTarget.shouldRestoreOriginalFocus {
                 await self.restoreFocusToRecordingTarget()
             }
@@ -2529,14 +2963,34 @@ struct ContentView: View {
                     targetPID: typingTarget.pid,
                     textReadyAt: finalTextReadyAt
                 )
+                self.logPipelineCompletion(
+                    outcome: String(describing: deliveryOutcome),
+                    pipelineID: pipelineID,
+                    pipelineStartedAt: pipelineStartedAt,
+                    textReadyAt: finalTextReadyAt
+                )
                 didTypeExternally = deliveryOutcome.didInsert
             } else {
+                let shouldHideOverlayAfterDelivery = !shouldShowAIProcessingFailure
+                    && !stopOverlay.didRequestHide
                 self.asr.typeOutputPlanToActiveField(
                     finalOutputPlan,
                     preferredTargetPID: typingTarget.pid,
                     textReadyAt: finalTextReadyAt,
-                    tracksDictionaryCorrections: true
+                    tracksDictionaryCorrections: true,
+                    completion: { outcome in
+                        self.handleTypingDelivery(
+                            outcome,
+                            pipelineID: pipelineID,
+                            pipelineStartedAt: pipelineStartedAt,
+                            textReadyAt: finalTextReadyAt,
+                            shouldHideOverlay: shouldHideOverlayAfterDelivery && spokenSendRequested,
+                            expectedOverlayLifecycleID: expectedOverlayLifecycleID
+                        )
+                    }
                 )
+                self.hideOverlayForDispatchedPaste(shouldHide: shouldHideOverlayAfterDelivery && !spokenSendRequested, lifecycleID: expectedOverlayLifecycleID)
+                didScheduleOverlayHideAfterDelivery = shouldHideOverlayAfterDelivery
                 didTypeExternally = true
             }
             if spokenSendRequested, !spokenSendAllowed {
@@ -2550,16 +3004,228 @@ struct ContentView: View {
                     try? await Task.sleep(nanoseconds: 650_000_000)
                 }
             }
-            NotchOverlayManager.shared.updateTranscriptionText("")
             NotchContentState.shared.setSpokenSendIndicatorState(.hidden)
-            if !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
+            if !shouldShowAIProcessingFailure,
+               !stopOverlay.didRequestHide,
+               !didScheduleOverlayHideAfterDelivery
+            {
+                NotchOverlayManager.shared.updateTranscriptionText("")
                 self.hideOverlayAfterOutput()
             }
         }
 
-        if !didTypeExternally, !shouldShowAIProcessingFailure, !didRequestOverlayHideOnStop {
+        // Submit raw fallback delivery before failure UI or notification work can
+        // compete with it on the main actor. Sandbox runs never present either.
+        if shouldShowAIProcessingFailure {
+            self.pendingAIReprocessText = spokenSendParse.shouldSend ? normalizedTranscribedText : transcribedText
+            NotchContentState.shared.showAIProcessingFailure()
+            self.menuBarManager.finishProcessingKeepingOverlayVisible()
+            if let aiFallbackNotificationError {
+                NotificationService.showAIProcessingFallback(error: aiFallbackNotificationError)
+            }
+        }
+
+        if !didTypeExternally, !shouldShowAIProcessingFailure, !stopOverlay.didRequestHide {
             self.hideOverlayAfterOutput()
         }
+        if !shouldTypeExternally {
+            self.logPipelineCompletion(
+                outcome: shouldPersistOutputs ? "internal_editor" : "sandbox",
+                pipelineID: pipelineID,
+                pipelineStartedAt: pipelineStartedAt,
+                textReadyAt: finalTextReadyAt
+            )
+        }
+    }
+
+    private func processDictationPromptTest(_ transcribedText: String) async {
+        let promptTest = DictationPromptTestCoordinator.shared
+        promptTest.lastTranscriptionText = transcribedText
+        promptTest.lastOutputText = ""
+        promptTest.lastError = ""
+        guard DictationAIPostProcessingGate.isProviderConfigured(
+            providerID: promptTest.draftProviderID,
+            model: promptTest.draftModel
+        ) else {
+            promptTest.lastError = "AI post-processing is not configured. Configure a provider/model (and API key for non-local endpoints) to test prompts."
+            self.menuBarManager.setProcessing(false)
+            return
+        }
+        promptTest.isProcessing = true
+        defer {
+            self.menuBarManager.setProcessing(false)
+            promptTest.isProcessing = false
+        }
+        do {
+            let result = try await self.processTextWithAI(
+                transcribedText,
+                overrideSystemPrompt: promptTest.draftPromptText,
+                overrideProviderID: promptTest.draftProviderID,
+                overrideModel: promptTest.draftModel
+            )
+            let appInfo = self.recordingAppInfo ?? self.getCurrentAppInfo()
+            let literalFormattedResult = ASRService.applyDictationLiteralFormatting(
+                result,
+                appName: appInfo.name,
+                bundleID: appInfo.bundleId,
+                windowTitle: appInfo.windowTitle
+            )
+            promptTest.lastOutputText = ASRService.applyGAAVFormatting(literalFormattedResult)
+        } catch {
+            DebugLogger.shared.error("Prompt test AI call failed: \(error.localizedDescription)", source: "ContentView")
+            promptTest.lastError = error.localizedDescription
+        }
+    }
+
+    private func makeAIProcessingFeedback(
+        lifecycleID: UInt64
+    ) -> (statusTask: Task<Void, Never>, streamPreview: DictationAIStreamPreviewBuffer) {
+        // Fast local cleanup should finish before transient SwiftUI work can queue
+        // ahead of its result. Slow providers still receive visible status feedback.
+        let statusTask = scheduleDeferredMainActorOperation(
+            afterNanoseconds: Self.aiProcessingStatusDelayNanoseconds
+        ) {
+            guard self.overlayLifecycleID == lifecycleID else {
+                self.appBench("processing_ui_skipped status=Refining reason=stale_lifecycle")
+                return
+            }
+            self.menuBarManager.flushDeferredStoppedRecordingState()
+            self.menuBarManager.setProcessing(true)
+            self.appBench("processing_ui_request status=Refining trigger=delayed_status")
+            NotchOverlayManager.shared.updateTranscriptionText("Refining")
+            self.appBench("processing_ui_requested status=Refining trigger=delayed_status")
+        }
+        let streamPreview = DictationAIStreamPreviewBuffer { text in
+            guard self.overlayLifecycleID == lifecycleID else { return }
+            NotchOverlayManager.shared.updateTranscriptionText(text)
+        }
+        return (statusTask, streamPreview)
+    }
+
+    private func prepareOverlayForASRStop(
+        shouldHideOverlayOnStop: Bool
+    ) -> (didRequestHide: Bool, onFinalTranscriptionStarted: (@MainActor () -> Void)?) {
+        if shouldHideOverlayOnStop {
+            DebugLogger.shared.debug("Hiding dictation overlay at stop path", source: "ContentView")
+            self.hideOverlayAsync(reason: "stop_path")
+            return (true, nil)
+        }
+
+        guard self.asr.isFinalTranscriptionReady else {
+            DebugLogger.shared.debug("Showing transcription processing state", source: "ContentView")
+            self.appBench("processing_ui_request status=Transcribing")
+            self.menuBarManager.setProcessing(true)
+            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
+            self.appBench("processing_ui_requested status=Transcribing")
+            return (false, nil)
+        }
+
+        // Own the overlay before isRunning changes, but publish processing UI
+        // only after final ASR has entered its executor.
+        self.menuBarManager.reserveProcessingOverlay()
+        self.appBench("processing_ui_reserved trigger=warm_final_asr")
+        let onFinalTranscriptionStarted: @MainActor () -> Void = {
+            self.menuBarManager.flushDeferredStoppedRecordingState()
+            self.appBench("processing_ui_request status=Transcribing trigger=final_executor")
+            self.menuBarManager.setProcessing(true)
+            NotchOverlayManager.shared.updateTranscriptionText("Transcribing")
+            self.appBench("processing_ui_requested status=Transcribing trigger=final_executor")
+        }
+        return (false, onFinalTranscriptionStarted)
+    }
+
+    private func holdStopUIInvalidation(whileProcessing: Bool) -> UInt64? {
+        whileProcessing ? self.asr.holdStopUIInvalidationForOutputPipeline() : nil
+    }
+
+    private func releaseStopUIInvalidation(_ generation: UInt64?) {
+        guard let generation else { return }
+        self.asr.releaseStopUIInvalidationForOutputPipeline(generation)
+    }
+
+    private func hideOverlayForDispatchedPaste(shouldHide: Bool, lifecycleID: UInt64) {
+        guard shouldHide, self.overlayLifecycleID == lifecycleID else { return }
+        self.appBench("overlay_hide_request reason=paste_dispatched")
+        self.menuBarManager.beginProcessingCompletionAndHideOverlay()
+    }
+
+    private func handleTypingDelivery(
+        _ outcome: TypingService.DeliveryOutcome,
+        pipelineID: String,
+        pipelineStartedAt: TimeInterval,
+        textReadyAt: TimeInterval,
+        shouldHideOverlay: Bool,
+        expectedOverlayLifecycleID: UInt64
+    ) {
+        self.logPipelineCompletion(
+            outcome: String(describing: outcome),
+            pipelineID: pipelineID,
+            pipelineStartedAt: pipelineStartedAt,
+            textReadyAt: textReadyAt
+        )
+        guard shouldHideOverlay else { return }
+        guard self.overlayLifecycleID == expectedOverlayLifecycleID else {
+            self.appBench(
+                "overlay_hide_skipped reason=delivery_complete staleLifecycle=\(expectedOverlayLifecycleID) currentLifecycle=\(self.overlayLifecycleID)"
+            )
+            return
+        }
+        // Preserve delivery-timed dismissal for the send-suppressed status path.
+        // Ordinary dictation already hid in the dispatch turn and returns above.
+        self.appBench("overlay_hide_request reason=delivery_complete outcome=\(outcome)")
+        self.menuBarManager.beginProcessingCompletionAndHideOverlay()
+    }
+
+    private func logPipelineCompletion(
+        outcome: String,
+        pipelineID: String,
+        pipelineStartedAt: TimeInterval,
+        textReadyAt: TimeInterval
+    ) {
+        let finishedAt = ProcessInfo.processInfo.systemUptime
+        DebugLogger.shared.info(
+            "PIPELINE_SUMMARY id=\(pipelineID) t=\(finishedAt) " +
+                "stopToReadyMs=\((textReadyAt - pipelineStartedAt) * 1000) readyToDeliveryMs=\((finishedAt - textReadyAt) * 1000) " +
+                "totalMs=\((finishedAt - pipelineStartedAt) * 1000) outcome=\(outcome)",
+            source: "AppBenchmark"
+        )
+    }
+
+    private func recordCompletedDictationPerformance(
+        route: DictationOutputRoute,
+        pipelineStartedAt: TimeInterval,
+        readyAt: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        transcriptionDurationMilliseconds: Int?,
+        aiProcessingDurationMilliseconds: Int?,
+        fluidIntelligenceDurationMilliseconds: Int?,
+        outcome: String
+    ) {
+        guard route == .normal else { return }
+        let readyMilliseconds = Int(((readyAt - pipelineStartedAt) * 1000).rounded())
+        DebugLogger.shared.info(
+            DictationPerformanceLogSummary.line(
+                asrMilliseconds: transcriptionDurationMilliseconds,
+                aiMilliseconds: aiProcessingDurationMilliseconds,
+                readyMilliseconds: readyMilliseconds,
+                outcome: outcome
+            ),
+            source: "AppBenchmark"
+        )
+        AnalyticsService.shared.recordBetaDictationPerformance(
+            asrMilliseconds: transcriptionDurationMilliseconds,
+            fluidIntelligenceMilliseconds: fluidIntelligenceDurationMilliseconds
+        )
+    }
+
+    private func recordEmptyDictationPerformance(startedAt: TimeInterval, asrMs: Int?) {
+        self.recordCompletedDictationPerformance(
+            route: .normal,
+            pipelineStartedAt: startedAt,
+            transcriptionDurationMilliseconds: asrMs,
+            aiProcessingDurationMilliseconds: nil,
+            fluidIntelligenceDurationMilliseconds: nil,
+            outcome: self.asr.lastStopOutcome == .failed ? "asr_failed" : "empty"
+        )
     }
 
     private func hideOverlayAfterOutput() {
@@ -2732,6 +3398,7 @@ struct ContentView: View {
         else {
             return
         }
+        let saveGeneration = TranscriptionHistoryStore.shared.audioSaveGeneration
 
         Task.detached(priority: .utility) {
             let result: (metadata: DictationAudioMetadata?, error: String?) = {
@@ -2750,10 +3417,17 @@ struct ContentView: View {
 
             await MainActor.run {
                 if let metadata = result.metadata {
-                    TranscriptionHistoryStore.shared.attachAudio(metadata, to: entryID)
+                    TranscriptionHistoryStore.shared.attachAudio(
+                        metadata,
+                        to: entryID,
+                        expectedSaveGeneration: saveGeneration
+                    )
                 } else if let error = result.error {
                     DebugLogger.shared.error("Failed to save dictation audio: \(error)", source: "ContentView")
                 }
+            }
+            if let metadata = result.metadata {
+                DictationAudioHistoryStore.shared.completePendingSave(fileName: metadata.fileName)
             }
         }
     }
@@ -3012,11 +3686,12 @@ struct ContentView: View {
         self.setActiveRecordingMode(.dictate)
         self.menuBarManager.setProcessing(true)
         NotchOverlayManager.shared.updateTranscriptionText("Reprocessing...")
-        await Task.yield()
 
         var aiFallbackReason: String?
         var postProcessingModel: String?
-        var aiEnhancementDurationMs: Int?
+        var aiProcessingDurationMilliseconds: Int?
+        var aiTokensPerSecond: Double?
+        var aiFallbackNotificationError: String?
         var aiPromptSnapshot: String?
         let appInfo = self.getCurrentAppInfo()
         let normalizedTranscribedText = ASRService.applySpokenPunctuationFormatting(
@@ -3032,14 +3707,15 @@ struct ContentView: View {
                 dictationSlot: .primary,
                 appBundleID: appInfo.bundleId
             ).model
-            let postProcessingStart = Date()
+            let postProcessingStart = ProcessInfo.processInfo.systemUptime
             do {
-                let outcome = try await self.processTextWithAI(
+                let result = try await self.processTextWithAIMetrics(
                     normalizedTranscribedText,
                     dictationSlot: .primary
                 )
-                finalText = outcome.text
-                aiPromptSnapshot = outcome.promptSnapshot
+                finalText = result.text
+                aiPromptSnapshot = result.promptSnapshot
+                aiTokensPerSecond = result.tokensPerSecond
             } catch {
                 DebugLogger.shared.error(
                     "AI reprocess failed, falling back to raw transcription: \(error.localizedDescription)",
@@ -3047,13 +3723,13 @@ struct ContentView: View {
                 )
                 aiFallbackReason = error.localizedDescription
                 aiPromptSnapshot = self.lastAIPromptSnapshot
-                NotificationService.showAIProcessingFallback(error: error.localizedDescription)
+                aiFallbackNotificationError = DictationAIFailurePresentationPolicy.notificationMessage(for: error)
                 finalText = normalizedTranscribedText
             }
-            aiEnhancementDurationMs = Int((Date().timeIntervalSince(postProcessingStart) * 1000).rounded())
+            aiProcessingDurationMilliseconds = Int(
+                ((ProcessInfo.processInfo.systemUptime - postProcessingStart) * 1000).rounded()
+            )
         }
-
-        NotchOverlayManager.shared.updateTranscriptionText("")
 
         finalText = ASRService.applyDictationLiteralFormatting(
             finalText,
@@ -3088,16 +3764,18 @@ struct ContentView: View {
                 windowTitle: appInfo.windowTitle,
                 wasAIProcessed: postProcessingModel != nil && aiFallbackReason == nil,
                 processingModel: postProcessingModel,
-                aiEnhancementDurationMs: aiEnhancementDurationMs,
+                aiEnhancementDurationMs: aiProcessingDurationMilliseconds,
                 aiPromptSnapshot: aiPromptSnapshot,
+                aiProcessingDurationMilliseconds: aiProcessingDurationMilliseconds,
+                aiTokensPerSecond: aiTokensPerSecond,
                 aiProcessingError: aiFallbackReason
             )
         }
-        if aiFallbackReason != nil {
-            self.pendingAIReprocessText = transcribedText
-            NotchContentState.shared.showAIProcessingFailure()
-            self.menuBarManager.finishProcessingKeepingOverlayVisible()
-        } else {
+        let shouldShowAIProcessingFailure = DictationAIFailurePresentationPolicy.shouldPresent(
+            shouldPersistOutputs: true,
+            fallbackReason: aiFallbackReason
+        )
+        if !shouldShowAIProcessingFailure {
             self.pendingAIReprocessText = nil
         }
 
@@ -3123,7 +3801,15 @@ struct ContentView: View {
             )
         }
 
-        if aiFallbackReason == nil {
+        NotchOverlayManager.shared.updateTranscriptionText("")
+        if shouldShowAIProcessingFailure {
+            self.pendingAIReprocessText = transcribedText
+            NotchContentState.shared.showAIProcessingFailure()
+            self.menuBarManager.finishProcessingKeepingOverlayVisible()
+            if let aiFallbackNotificationError {
+                NotificationService.showAIProcessingFallback(error: aiFallbackNotificationError)
+            }
+        } else {
             self.hideOverlayAfterOutput()
         }
 
@@ -3344,7 +4030,13 @@ struct ContentView: View {
 
     private func prewarmPrivateAIDictationIfNeeded(for slot: SettingsStore.DictationShortcutSlot) {
         let appBundleID = self.recordingAppInfo?.bundleId
-        guard PrivateAIProviderPromptFormat.isAvailable(settings: SettingsStore.shared),
+        let settings = SettingsStore.shared
+        let route = DictationProviderRoute.resolve(
+            settings: settings,
+            dictationSlot: slot,
+            appBundleID: appBundleID
+        )
+        guard route.usesPrivateAI,
               DictationAIPostProcessingGate.isConfigured(for: slot, appBundleID: appBundleID)
         else { return }
 
@@ -3511,15 +4203,7 @@ struct ContentView: View {
             _ = self.handleCancelShortcut()
         }
         NotchContentState.shared.onDictationPromptSelectionRequested = { selection in
-            let privateAIAvailable = PrivateAIProviderPromptFormat.isAvailable()
-            switch selection {
-            case .off:
-                break
-            case .privateAI:
-                guard privateAIAvailable else { return }
-            case .default, .profile:
-                guard !privateAIAvailable else { return }
-            }
+            guard selection != .privateAI || PrivateAIProviderPromptFormat.isAvailable() else { return }
             let slot = self.activeDictationShortcutSlot ?? .primary
             SettingsStore.shared.setDictationPromptSelection(selection, for: slot)
             self.applyDictationShortcutSelectionContext(for: slot)
@@ -3693,7 +4377,7 @@ struct ContentView: View {
             if self.selectedSidebarItem == .rewriteMode {
                 DebugLogger.shared.debug("Cancel callback: closing mode view", source: "ContentView")
                 DispatchQueue.main.async {
-                    self.selectedSidebarItem = .welcome
+                    self.navigateToApp(.welcome)
                 }
                 handled = true
             }
@@ -3768,8 +4452,7 @@ struct ContentView: View {
 
         if self.selectedSidebarItem == .rewriteMode {
             DebugLogger.shared.debug("Cancel shortcut: closing mode view", source: "ContentView")
-            let isOnboarded = self.asr.isAsrReady || self.asr.modelsExistOnDisk
-            self.selectedSidebarItem = isOnboarded ? .preferences : .welcome
+            self.navigateToApp(.welcome)
             handled = true
         }
 
@@ -3945,10 +4628,7 @@ extension ContentView {
                 return
             }
 
-            self.promptModeOverrideText = SettingsStore.combineBasePrompt(
-                for: .dictate,
-                with: SettingsStore.stripBasePrompt(for: .dictate, from: profile.prompt)
-            )
+            self.promptModeOverrideText = settings.shortcutOverrideSystemPrompt(for: profile, mode: .dictate)
             NotchContentState.shared.promptModeOverrideProfileName = profile.name
             NotchContentState.shared.promptModeOverrideProfileID = profile.id
         }
@@ -4027,6 +4707,18 @@ extension ContentView {
 
     private func appBench(_ message: String) {
         DebugLogger.shared.benchmark("APP_BENCH", message: message, source: "AppBenchmark")
+    }
+
+    private func logAIProcessCall(
+        _ pipelineID: String,
+        _ modelInfo: (provider: String?, model: String?),
+        _ inputChars: Int
+    ) {
+        let provider = (modelInfo.provider ?? "unknown").replacingOccurrences(of: " ", with: "_")
+        let model = (modelInfo.model ?? "unknown").replacingOccurrences(of: " ", with: "_")
+        self.appBench(
+            "ai_process_call id=\(pipelineID) provider=\(provider) model=\(model) inputChars=\(inputChars)"
+        )
     }
 
     private func callOpenAIChat() async {
@@ -4113,9 +4805,7 @@ extension ContentView {
 
     private func completeOnboarding(selecting target: SidebarItem? = nil) {
         self.settings.onboardingCompleted = true
-
-        let isOnboarded = self.asr.isAsrReady || self.asr.modelsExistOnDisk
-        self.selectedSidebarItem = target ?? (isOnboarded ? .preferences : .welcome)
+        self.navigateToApp(target ?? .welcome)
     }
 
     private func missingOnboardingCompletionRequirements(allowsAIConfiguration: Bool = false) -> [String] {
@@ -4497,6 +5187,109 @@ extension ContentView {
 }
 
 // swiftlint:enable type_body_length
+
+@MainActor
+private enum SidebarSymbolCache {
+    private static let symbolNames = [
+        "waveform",
+        "brain",
+        "cpu",
+        "wand.and.stars",
+        "text.book.closed.fill",
+        "terminal.fill",
+        "doc.text.fill",
+        "clock.arrow.circlepath",
+        "chart.bar.fill",
+        "house.fill",
+        "doc.text.magnifyingglass",
+        "envelope.fill",
+    ]
+
+    private static let images: [String: NSImage] = {
+        let configuration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+            .applying(.preferringHierarchical())
+        var images: [String: NSImage] = [:]
+
+        for name in symbolNames {
+            guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(configuration)
+            else { continue }
+
+            image.isTemplate = true
+            image.cacheMode = .always
+            images[name] = image
+        }
+
+        return images
+    }()
+
+    static func image(named name: String) -> NSImage {
+        self.images[name] ?? NSImage(systemSymbolName: "questionmark", accessibilityDescription: nil) ?? NSImage()
+    }
+}
+
+private struct SidebarChromeButtonStyle: ButtonStyle {
+    let isHovered: Bool
+    let reduceMotion: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        let scale = self.reduceMotion || !configuration.isPressed ? 1 : 0.985
+
+        configuration.label
+            .foregroundStyle(.primary)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(self.backgroundOpacity(isPressed: configuration.isPressed)))
+            )
+            .scaleEffect(scale)
+            .animation(.easeOut(duration: self.reduceMotion ? 0.08 : 0.1), value: configuration.isPressed)
+            .animation(.easeOut(duration: 0.1), value: self.isHovered)
+    }
+
+    private func backgroundOpacity(isPressed: Bool) -> Double {
+        if isPressed {
+            return 0.12
+        }
+        return self.isHovered ? 0.08 : 0
+    }
+}
+
+private extension View {
+    func sidebarOptionHover(isSelected: Bool, reduceMotion: Bool) -> some View {
+        modifier(SidebarOptionHoverModifier(isSelected: isSelected, reduceMotion: reduceMotion))
+    }
+}
+
+private struct SidebarOptionHoverModifier: ViewModifier {
+    let isSelected: Bool
+    let reduceMotion: Bool
+
+    @Environment(\.theme) private var theme
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(self.backgroundColor)
+            )
+            .padding(.horizontal, -5)
+            .padding(.vertical, -3)
+            .contentShape(Rectangle())
+            .onHover { self.isHovered = $0 }
+            .animation(.easeOut(duration: self.reduceMotion ? 0.08 : 0.12), value: self.isHovered)
+    }
+
+    private var backgroundColor: Color {
+        if self.isSelected {
+            return self.theme.palette.accent
+        }
+        return Color.primary.opacity(self.isHovered ? 0.08 : 0)
+    }
+}
 
 private struct AccessibilitySettingsFloatingGuideView: View {
     let appURL: URL

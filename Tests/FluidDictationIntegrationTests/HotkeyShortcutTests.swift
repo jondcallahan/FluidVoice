@@ -20,6 +20,107 @@ final class HotkeyShortcutTests: XCTestCase {
     private let incrementalParakeetEnabledKey = "ExperimentalParakeetUnifiedFinalEnabled"
 
     @MainActor
+    func testActiveShortcutSummaryListsEverySourceWithKeyCodes() {
+        let summary = GlobalHotkeyManager.activeShortcutSummary(.init(
+            primary: [HotkeyShortcut(keyCode: 61, modifierFlags: [], modifierKeyCodes: [61])],
+            promptAssignments: [(key: "__default__", shortcut: HotkeyShortcut(keyCode: 55, modifierFlags: [], modifierKeyCodes: [55]))],
+            secondaryPromptMode: HotkeyShortcut(keyCode: 60, modifierFlags: []),
+            secondaryPromptModeEnabled: false,
+            command: nil,
+            commandEnabled: false,
+            edit: HotkeyShortcut(keyCode: 15, modifierFlags: [.option]),
+            editEnabled: true,
+            cancel: HotkeyShortcut(keyCode: 53, modifierFlags: []),
+            pasteLast: HotkeyShortcut(mouseButton: 0, modifierFlags: [.command]),
+            pasteLastEnabled: true,
+            mode: .automatic
+        ))
+
+        XCTAssertTrue(summary.hasPrefix("mode=automatic"))
+        XCTAssertTrue(summary.contains("primary[0]=Right ⌥ [keyCode=61"), summary)
+        XCTAssertTrue(summary.contains("prompt[__default__]=Left ⌘ [keyCode=55"), summary)
+        XCTAssertTrue(summary.contains("secondaryPromptMode=Right ⇧ [keyCode=60 flags=0] enabled=false"), summary)
+        XCTAssertTrue(summary.contains("command=none enabled=false"), summary)
+        XCTAssertTrue(summary.contains("edit=⌥ + R [keyCode=15"), summary)
+        XCTAssertTrue(summary.contains("cancel=Escape [keyCode=53"), summary)
+        XCTAssertTrue(summary.contains("pasteLast=⌘ + Left Click [button=0"), summary)
+    }
+
+    func testKeyboardEventMaskExcludesMouseEvents() {
+        let mask = GlobalHotkeyManager.keyboardEventMask()
+        for type in [CGEventType.keyDown, .keyUp, .flagsChanged] {
+            XCTAssertNotEqual(mask & (CGEventMask(1) << type.rawValue), 0, "keyboard mask must include \(type)")
+        }
+        for type in [CGEventType.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp] {
+            XCTAssertEqual(mask & (CGEventMask(1) << type.rawValue), 0, "keyboard mask must not include \(type)")
+        }
+    }
+
+    func testMouseObserverMaskCoversOnlyMouseDowns() {
+        let mask = GlobalHotkeyManager.mouseObserverEventMask()
+        for type in [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown] {
+            XCTAssertNotEqual(mask & (CGEventMask(1) << type.rawValue), 0, "observer mask must include \(type)")
+        }
+        for type in [CGEventType.leftMouseUp, .rightMouseUp, .otherMouseUp, .keyDown, .keyUp, .flagsChanged] {
+            XCTAssertEqual(mask & (CGEventMask(1) << type.rawValue), 0, "observer mask must not include \(type)")
+        }
+    }
+
+    func testMouseShortcutMaskMatchesConfiguredButtons() {
+        XCTAssertEqual(GlobalHotkeyManager.mouseShortcutEventMask(mouseButtons: []), 0)
+
+        let leftOnly = GlobalHotkeyManager.mouseShortcutEventMask(mouseButtons: [0])
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            XCTAssertNotEqual(leftOnly & (CGEventMask(1) << type.rawValue), 0)
+        }
+        for type in [CGEventType.rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .keyDown, .flagsChanged] {
+            XCTAssertEqual(leftOnly & (CGEventMask(1) << type.rawValue), 0, "left-only mask must not include \(type)")
+        }
+
+        let sideButton = GlobalHotkeyManager.mouseShortcutEventMask(mouseButtons: [3])
+        for type in [CGEventType.otherMouseDown, .otherMouseUp] {
+            XCTAssertNotEqual(sideButton & (CGEventMask(1) << type.rawValue), 0)
+        }
+        for type in [CGEventType.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp] {
+            XCTAssertEqual(sideButton & (CGEventMask(1) << type.rawValue), 0, "side-button mask must not include \(type)")
+        }
+    }
+
+    func testModifierOnlyShortcutIgnoresTapAfterMouseClick() {
+        let replay = ModifierOnlyFlagsReplay(
+            shortcut: HotkeyShortcut(keyCode: 58, modifierFlags: .option, modifierKeyCodes: [58])
+        )
+
+        replay.flagsChanged(keyCode: 58, modifiers: .option, nextPressed: [58])
+        XCTAssertEqual(replay.activeModifierOnlyType, .transcription)
+
+        replay.mouseDown()
+        replay.flagsChanged(keyCode: 58, modifiers: [], nextPressed: [])
+
+        XCTAssertEqual(replay.cleanFinishCount, 0, "Option+click must not read as an Option tap")
+        XCTAssertNil(replay.activeModifierOnlyType)
+    }
+
+    func testMicrophoneChangeAlertsSupportProductionAndDebugAppsOnly() {
+        XCTAssertTrue(MicrophoneChangeOverlayController.supportsAlerts(bundleIdentifier: "com.FluidApp.app"))
+        XCTAssertTrue(MicrophoneChangeOverlayController.supportsAlerts(bundleIdentifier: "com.FluidApp.app.debug"))
+        XCTAssertFalse(MicrophoneChangeOverlayController.supportsAlerts(bundleIdentifier: "com.example.tests"))
+        XCTAssertFalse(MicrophoneChangeOverlayController.supportsAlerts(bundleIdentifier: nil))
+    }
+
+    func testInterruptedMousePressForceStopsHoldAndAutomaticModes() {
+        XCTAssertTrue(GlobalHotkeyManager.shouldForceStopInterruptedPrimaryPress(activationMode: .hold))
+        XCTAssertTrue(GlobalHotkeyManager.shouldForceStopInterruptedPrimaryPress(activationMode: .automatic))
+        XCTAssertFalse(GlobalHotkeyManager.shouldForceStopInterruptedPrimaryPress(activationMode: .toggle))
+    }
+
+    func testHotkeySessionLockDetection() {
+        XCTAssertTrue(GlobalHotkeyManager.sessionIsLocked(sessionInfo: ["CGSSessionScreenIsLocked": true]))
+        XCTAssertFalse(GlobalHotkeyManager.sessionIsLocked(sessionInfo: ["CGSSessionScreenIsLocked": false]))
+        XCTAssertFalse(GlobalHotkeyManager.sessionIsLocked(sessionInfo: [:]))
+    }
+
+    @MainActor
     func testBottomOverlayRapidStopStartStopDoesNotDropFinalHide() async {
         let audioPublisher = Just(CGFloat.zero).eraseToAnyPublisher()
         let controller = BottomOverlayWindowController.shared
@@ -28,7 +129,12 @@ final class HotkeyShortcutTests: XCTestCase {
         await Task.yield()
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
         controller.hide()
+        XCTAssertTrue(
+            NotchContentState.shared.isBottomOverlayDismissing,
+            "A nonblocking hide must start the visual transition before returning"
+        )
         controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        XCTAssertFalse(NotchContentState.shared.isBottomOverlayDismissing)
         let outcome = await controller.hideAndWait()
 
         XCTAssertEqual(outcome, .hidden)
@@ -52,6 +158,25 @@ final class HotkeyShortcutTests: XCTestCase {
         let hideOutcome = await hideTask.value
         XCTAssertEqual(hideOutcome, .superseded)
         XCTAssertTrue(NotchContentState.shared.isBottomOverlayPresented)
+        _ = await controller.hideAndWait()
+    }
+
+    @MainActor
+    func testBottomOverlayImmediateHideCompletesBeforeReturningAndAllowsRestart() async {
+        let audioPublisher = Just(CGFloat.zero).eraseToAnyPublisher()
+        let controller = BottomOverlayWindowController.shared
+
+        controller.prepare()
+        await Task.yield()
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        controller.hideImmediately()
+
+        XCTAssertTrue(controller.isVisuallyHiddenForTests)
+
+        controller.show(audioPublisher: audioPublisher, mode: .dictation)
+        XCTAssertTrue(NotchContentState.shared.isBottomOverlayPresented)
+        XCTAssertFalse(controller.isVisuallyHiddenForTests)
+        XCTAssertFalse(NotchContentState.shared.isBottomOverlayDismissing)
         _ = await controller.hideAndWait()
     }
 
@@ -127,7 +252,7 @@ final class HotkeyShortcutTests: XCTestCase {
         defer { settingsStore.skipSilentRecordingsEnabled = originalValue }
 
         settingsStore.skipSilentRecordingsEnabled = true
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         XCTAssertEqual(document.settings.skipSilentRecordingsEnabled, true)
 
         let encoded = try BackupService.shared.encode(document)
@@ -157,7 +282,7 @@ final class HotkeyShortcutTests: XCTestCase {
         XCTAssertTrue(SettingsStore.shared.experimentalParakeetUnifiedFinalEnabled)
 
         SettingsStore.shared.experimentalParakeetUnifiedFinalEnabled = false
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         XCTAssertEqual(document.settings.experimentalParakeetUnifiedFinalEnabled, false)
 
         let encoded = try BackupService.shared.encode(document)
@@ -168,6 +293,36 @@ final class HotkeyShortcutTests: XCTestCase {
 
         let legacyBackup = try BackupService.shared.decode(JSONSerialization.data(withJSONObject: root))
         XCTAssertNil(legacyBackup.settings.experimentalParakeetUnifiedFinalEnabled)
+    }
+
+    @MainActor
+    func testHistoryPerformanceDefaultsOffAndRoundTripsWithoutBreakingLegacyBackups() async throws {
+        let defaults = UserDefaults.standard
+        let key = "ShowHistoryPerformanceMetrics"
+        let originalValue = defaults.object(forKey: key)
+        defer {
+            if let originalValue {
+                defaults.set(originalValue, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        defaults.removeObject(forKey: key)
+        XCTAssertFalse(SettingsStore.shared.showHistoryPerformanceMetrics)
+
+        SettingsStore.shared.showHistoryPerformanceMetrics = true
+        let document = try await BackupService.shared.makeBackupDocument()
+        XCTAssertEqual(document.settings.showHistoryPerformanceMetrics, true)
+
+        let encoded = try BackupService.shared.encode(document)
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var settings = try XCTUnwrap(root["settings"] as? [String: Any])
+        settings.removeValue(forKey: "showHistoryPerformanceMetrics")
+        root["settings"] = settings
+
+        let legacyBackup = try BackupService.shared.decode(JSONSerialization.data(withJSONObject: root))
+        XCTAssertNil(legacyBackup.settings.showHistoryPerformanceMetrics)
     }
 
     @MainActor
@@ -209,7 +364,7 @@ final class HotkeyShortcutTests: XCTestCase {
 
     @MainActor
     func testLegacySystemModeBackupQueuesMicrophonePriorityMigration() async throws {
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
 
         try self.withRestoredDefaults(keys: [
             self.microphoneSelectionModeKey,
@@ -235,8 +390,8 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
-    func testPriorityBackupKeepsCompletedMicrophoneMigration() async {
-        let document = await BackupService.shared.makeBackupDocument()
+    func testPriorityBackupKeepsCompletedMicrophoneMigration() async throws {
+        let document = try await BackupService.shared.makeBackupDocument()
 
         self.withRestoredDefaults(keys: [self.microphoneSelectionMigrationVersionKey]) {
             SettingsStore.shared.microphoneSelectionMigrationVersion = 4
@@ -248,7 +403,7 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
-    func testPriorityBackupRoundTripsRemovedConnectedMicrophones() async {
+    func testPriorityBackupRoundTripsRemovedConnectedMicrophones() async throws {
         let originalPriority = SettingsStore.shared.microphonePriority
         let originalSuppressedUIDs = SettingsStore.shared.suppressedMicrophoneUIDs
         defer {
@@ -260,7 +415,7 @@ final class HotkeyShortcutTests: XCTestCase {
             .init(uid: "kept-mic", name: "Kept Microphone"),
         ]
         SettingsStore.shared.suppressedMicrophoneUIDs = ["removed-connected-mic"]
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
 
         XCTAssertEqual(document.settings.suppressedMicrophoneUIDs, ["removed-connected-mic"])
         SettingsStore.shared.suppressedMicrophoneUIDs = []
@@ -1790,7 +1945,7 @@ final class HotkeyShortcutTests: XCTestCase {
     }
 
     @MainActor
-    func testRemovedConnectedMicrophoneReturnsAtSecondAfterReconnect() throws {
+    func testRemovedConnectedMicrophoneStaysRemovedAfterReconnect() throws {
         try self.withRestoredDefaults(keys: [
             self.preferredInputDeviceUIDKey,
             self.microphonePriorityKey,
@@ -1813,16 +1968,19 @@ final class HotkeyShortcutTests: XCTestCase {
             XCTAssertEqual(SettingsStore.shared.microphonePriority.map(\.uid), [usb.uid])
 
             SettingsStore.shared.reconcileMicrophonePriority(with: [usb])
+            XCTAssertTrue(SettingsStore.shared.suppressedMicrophoneUIDs.contains(builtIn.uid))
+
             SettingsStore.shared.reconcileMicrophonePriority(with: [builtIn, usb])
-            XCTAssertEqual(SettingsStore.shared.microphonePriority.map(\.uid), [usb.uid, builtIn.uid])
+            XCTAssertEqual(SettingsStore.shared.microphonePriority.map(\.uid), [usb.uid])
+            XCTAssertEqual(coordinator.inputDeviceForCapture(), usb)
         }
     }
 
     @MainActor
-    func testSelectingOrRestoringMicrophoneClearsRemovalSuppression() async {
+    func testSelectingOrRestoringMicrophoneClearsRemovalSuppression() async throws {
         let originalSuppressedUIDs = SettingsStore.shared.suppressedMicrophoneUIDs
         SettingsStore.shared.suppressedMicrophoneUIDs = []
-        let document = await BackupService.shared.makeBackupDocument()
+        let document = try await BackupService.shared.makeBackupDocument()
         defer { SettingsStore.shared.suppressedMicrophoneUIDs = originalSuppressedUIDs }
 
         self.withRestoredDefaults(keys: [
@@ -1981,5 +2139,10 @@ private final class ModifierOnlyFlagsReplay {
         if self.activeModifierOnlyType != nil {
             self.otherKeyPressedDuringModifier = true
         }
+    }
+
+    /// Same mark as keyDown; the mouse observer tap calls markOtherInputDuringModifierOnly too.
+    func mouseDown() {
+        self.keyDown()
     }
 }

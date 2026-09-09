@@ -1,190 +1,8 @@
 import Foundation
 
-enum PrivateAIMLXUpgradeCoordinator {
-    private static let offerVersion = "1.6.3"
-    private static let offerHandledKey = "FluidIntelligenceMLXUpgrade163OfferHandled"
-    private static let offerPreparedKey = "FluidIntelligenceMLXUpgrade163OfferPrepared"
-    private static let upgradePendingKey = "FluidIntelligenceMLXUpgrade163Pending"
-    private static let previousVerificationKey = "FluidIntelligenceMLXUpgrade163PreviousVerification"
-    private static let legacyLlamaFilenames = ["fluid-1-q4_k_m.gguf", "Fluid-1-Q4_K_M.gguf"]
-
-    static func prepareOfferIfNeeded(
-        settings: SettingsStore = .shared,
-        defaults: UserDefaults = .standard,
-        modelDirectoryURL: URL = PrivateAIIntegrationService.modelDirectoryURL,
-        isAppleSilicon: Bool = CPUArchitecture.isAppleSilicon,
-        appVersion: String = Bundle.main.object(
-            forInfoDictionaryKey: "CFBundleShortVersionString"
-        ) as? String ?? ""
-    ) -> Bool {
-        if defaults.bool(forKey: self.upgradePendingKey) {
-            self.restorePreviousLlama(settings: settings, defaults: defaults)
-            return false
-        }
-
-        guard appVersion == self.offerVersion else {
-            defaults.set(false, forKey: self.offerPreparedKey)
-            return false
-        }
-
-        if defaults.bool(forKey: self.offerPreparedKey),
-           !defaults.bool(forKey: self.offerHandledKey)
-        {
-            let rawBackend = defaults.string(forKey: SettingsStore.privateAIBackendPreferenceDefaultsKey)
-            guard self.shouldResumePreparedOffer(
-                hasPrivateProvider: PrivateFeatures.privateAIProvider,
-                isAppleSilicon: isAppleSilicon,
-                appVersion: appVersion,
-                backendPreference: rawBackend.flatMap(SettingsStore.PrivateAIBackendPreference.init(rawValue:)),
-                hasLegacyLlamaModel: self.hasLegacyLlamaModel(in: modelDirectoryURL),
-                hasMLXModel: PrivateAIIntegrationService.hasInactiveInstalledModel(
-                    keeping: PrivateAIModelRegistry.defaultModel
-                )
-            ) else {
-                defaults.set(false, forKey: self.offerPreparedKey)
-                return false
-            }
-
-            settings.privateAIBackendPreference = .llama
-            self.migrateLegacyVerificationToLlama(settings: settings)
-            return true
-        }
-
-        guard self.shouldOffer(
-            hasPrivateProvider: PrivateFeatures.privateAIProvider,
-            isAppleSilicon: isAppleSilicon,
-            appVersion: appVersion,
-            backendPreferenceWasSet: defaults.object(
-                forKey: SettingsStore.privateAIBackendPreferenceDefaultsKey
-            ) != nil,
-            hasLegacyLlamaModel: self.hasLegacyLlamaModel(in: modelDirectoryURL),
-            hasMLXModel: PrivateAIIntegrationService.isModelInstalled(PrivateAIModelRegistry.defaultModel),
-            offerWasHandled: defaults.bool(forKey: self.offerHandledKey)
-        ) else {
-            return false
-        }
-
-        settings.privateAIBackendPreference = .llama
-        self.migrateLegacyVerificationToLlama(settings: settings)
-        defaults.set(true, forKey: self.offerPreparedKey)
-        return true
-    }
-
-    static func beginUpgrade(
-        settings: SettingsStore = .shared,
-        defaults: UserDefaults = .standard
-    ) {
-        let key = self.privateProviderKey
-        if let verification = settings.verifiedProviderFingerprints[key] {
-            defaults.set(verification, forKey: self.previousVerificationKey)
-        } else {
-            defaults.removeObject(forKey: self.previousVerificationKey)
-        }
-
-        defaults.set(true, forKey: self.offerHandledKey)
-        defaults.set(false, forKey: self.offerPreparedKey)
-        defaults.set(true, forKey: self.upgradePendingKey)
-        settings.privateAIBackendPreference = .mlx
-        settings.verifiedProviderFingerprints.removeValue(forKey: key)
-        defaults.removeObject(forKey: PrivateAIIntegrationService.localModelPathDefaultsKey)
-    }
-
-    static func keepCurrentModel(defaults: UserDefaults = .standard) {
-        defaults.set(true, forKey: self.offerHandledKey)
-        defaults.set(false, forKey: self.offerPreparedKey)
-        defaults.set(false, forKey: self.upgradePendingKey)
-        defaults.removeObject(forKey: self.previousVerificationKey)
-    }
-
-    static func completeUpgrade(defaults: UserDefaults = .standard) {
-        defaults.set(false, forKey: self.upgradePendingKey)
-        defaults.removeObject(forKey: self.previousVerificationKey)
-    }
-
-    static func restorePreviousLlama(
-        settings: SettingsStore = .shared,
-        defaults: UserDefaults = .standard
-    ) {
-        settings.privateAIBackendPreference = .llama
-        var fingerprints = settings.verifiedProviderFingerprints
-        if let verification = defaults.string(forKey: self.previousVerificationKey), !verification.isEmpty {
-            fingerprints[self.privateProviderKey] = verification
-        } else {
-            fingerprints.removeValue(forKey: self.privateProviderKey)
-        }
-        settings.verifiedProviderFingerprints = fingerprints
-        defaults.set(false, forKey: self.upgradePendingKey)
-        defaults.removeObject(forKey: self.previousVerificationKey)
-        defaults.removeObject(forKey: PrivateAIIntegrationService.localModelPathDefaultsKey)
-    }
-
-    static func isUpgradePending(defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: self.upgradePendingKey)
-    }
-
-    static func shouldOffer(
-        hasPrivateProvider: Bool,
-        isAppleSilicon: Bool,
-        appVersion: String,
-        backendPreferenceWasSet: Bool,
-        hasLegacyLlamaModel: Bool,
-        hasMLXModel: Bool,
-        offerWasHandled: Bool
-    ) -> Bool {
-        hasPrivateProvider &&
-            isAppleSilicon &&
-            appVersion == self.offerVersion &&
-            !backendPreferenceWasSet &&
-            hasLegacyLlamaModel &&
-            !hasMLXModel &&
-            !offerWasHandled
-    }
-
-    static func shouldResumePreparedOffer(
-        hasPrivateProvider: Bool,
-        isAppleSilicon: Bool,
-        appVersion: String,
-        backendPreference: SettingsStore.PrivateAIBackendPreference?,
-        hasLegacyLlamaModel: Bool,
-        hasMLXModel: Bool
-    ) -> Bool {
-        hasPrivateProvider &&
-            isAppleSilicon &&
-            appVersion == self.offerVersion &&
-            backendPreference == .llama &&
-            hasLegacyLlamaModel &&
-            !hasMLXModel
-    }
-
-    private static var privateProviderKey: String {
-        let providerID = PrivateAIProviderFeature.shared.providerID
-        if ModelRepository.shared.isBuiltIn(providerID) || providerID.hasPrefix("custom:") {
-            return providerID
-        }
-        return "custom:\(providerID)"
-    }
-
-    private static func hasLegacyLlamaModel(in directoryURL: URL) -> Bool {
-        self.legacyLlamaFilenames.contains {
-            FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent($0).path)
-        }
-    }
-
-    private static func migrateLegacyVerificationToLlama(settings: SettingsStore) {
-        let key = self.privateProviderKey
-        let legacyFingerprint = "private-ai-provider|\(PrivateAIProviderFeature.shared.defaultModelID)"
-        guard settings.verifiedProviderFingerprints[key] == legacyFingerprint else { return }
-
-        var fingerprints = settings.verifiedProviderFingerprints
-        fingerprints[key] = PrivateAIProviderFeature.verificationFingerprint(
-            for: PrivateAIProviderFeature.shared.defaultModelID
-        )
-        settings.verifiedProviderFingerprints = fingerprints
-    }
-}
-
 actor PrivateAIIntegrationService {
     static let shared = PrivateAIIntegrationService()
+    private nonisolated let dictationProviderOverride: (any PrivateAIIntegrationProviding)?
 
     static var selectedModelDefaultsKey: String {
         PrivateAIProviderFeature.shared.selectedModelDefaultsKey
@@ -217,6 +35,19 @@ actor PrivateAIIntegrationService {
         let outputText: String
         let backendKind: String?
         let latencyMilliseconds: Int?
+        let tokensPerSecond: Double?
+
+        init(
+            outputText: String,
+            backendKind: String?,
+            latencyMilliseconds: Int?,
+            tokensPerSecond: Double? = nil
+        ) {
+            self.outputText = outputText
+            self.backendKind = backendKind
+            self.latencyMilliseconds = latencyMilliseconds
+            self.tokensPerSecond = tokensPerSecond
+        }
     }
 
     struct LoadedModelState: Sendable, Equatable {
@@ -225,12 +56,24 @@ actor PrivateAIIntegrationService {
         let message: String?
     }
 
-    private init() {}
+    private init() {
+        self.dictationProviderOverride = nil
+    }
+
+    #if DEBUG
+    init(testingProvider: any PrivateAIIntegrationProviding) {
+        self.dictationProviderOverride = testingProvider
+    }
+    #endif
 
     private nonisolated static var provider: any PrivateAIIntegrationProviding {
         PrivateAIProviderFeature.shared.isAvailable
             ? PrivateAIProviderRegistry.integration
             : UnavailableAIIntegrationShim.shared
+    }
+
+    private nonisolated var dictationProvider: any PrivateAIIntegrationProviding {
+        self.dictationProviderOverride ?? Self.provider
     }
 
     nonisolated static var configuredModelID: String {
@@ -327,6 +170,27 @@ actor PrivateAIIntegrationService {
         try await self.provider.prepareModel(model, progressHandler: progressHandler)
     }
 
+    nonisolated static func modelUpdateStatus(
+        _ model: PrivateAIRegisteredModel
+    ) async -> PrivateAIModelUpdateStatus {
+        await self.provider.modelUpdateStatus(model)
+    }
+
+    nonisolated static func updateModel(
+        _ model: PrivateAIRegisteredModel,
+        progressHandler: PrivateAIModelDownloadProgressHandler? = nil
+    ) async throws -> PrivateAIModelUpdateToken {
+        try await self.provider.updateModel(model, progressHandler: progressHandler)
+    }
+
+    nonisolated static func commitModelUpdate(_ token: PrivateAIModelUpdateToken) async {
+        await self.provider.commitModelUpdate(token)
+    }
+
+    nonisolated static func rollbackModelUpdate(_ token: PrivateAIModelUpdateToken) async {
+        await self.provider.rollbackModelUpdate(token)
+    }
+
     nonisolated static var isLocalRuntimeConfigured: Bool {
         provider.isLocalRuntimeConfigured
     }
@@ -347,9 +211,12 @@ actor PrivateAIIntegrationService {
         let status = try await Self.provider.loadModel(model)
         guard status.state == .ready else { return status }
 
-        guard !PrivateAIMLXUpgradeCoordinator.isUpgradePending() else { return status }
         await self.removeInactiveInstalledModels(keeping: model)
         return status
+    }
+
+    func verifyModel(_ model: PrivateAIRegisteredModel) async throws -> PrivateAIStatus {
+        try await Self.provider.verifyModel(model)
     }
 
     func removeInactiveInstalledModels(keeping model: PrivateAIRegisteredModel) async {
@@ -386,31 +253,40 @@ actor PrivateAIIntegrationService {
         await Self.provider.shutdownForTermination()
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: RuntimeConfiguration,
         context: AppContext
     ) async throws -> EnhancementResult {
-        try Self.validateDictationHeadroom(inputText, contextTokenLimit: runtime.contextTokenLimit)
-        return try await Self.provider.enhanceDictation(inputText, runtime: runtime, context: context)
+        let budget = try Self.validatedDictationBudget(inputText, contextTokenLimit: runtime.contextTokenLimit)
+        return try await self.dictationProvider.enhanceDictation(
+            inputText,
+            runtime: runtime,
+            context: context,
+            maxOutputTokens: budget.maxOutputTokens
+        )
     }
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime: RuntimeConfiguration,
         context: AppContext,
         streamHandler: PrivateAIStreamHandler?
     ) async throws -> EnhancementResult {
-        try Self.validateDictationHeadroom(inputText, contextTokenLimit: runtime.contextTokenLimit)
-        return try await Self.provider.enhanceDictation(
+        let budget = try Self.validatedDictationBudget(inputText, contextTokenLimit: runtime.contextTokenLimit)
+        return try await self.dictationProvider.enhanceDictation(
             inputText,
             runtime: runtime,
             context: context,
+            maxOutputTokens: budget.maxOutputTokens,
             streamHandler: streamHandler
         )
     }
 
-    private nonisolated static func validateDictationHeadroom(_ inputText: String, contextTokenLimit: Int) throws {
+    private nonisolated static func validatedDictationBudget(
+        _ inputText: String,
+        contextTokenLimit: Int
+    ) throws -> SettingsStore.PrivateAIDictationTokenBudget {
         let budget = SettingsStore.privateAIDictationTokenBudget(
             forInputText: inputText,
             contextTokenLimit: contextTokenLimit
@@ -418,6 +294,7 @@ actor PrivateAIIntegrationService {
         guard budget.hasSufficientHeadroom else {
             throw AIProcessingError.dictationExceedsAIContextWindow
         }
+        return budget
     }
 
     func rewrite(
@@ -494,10 +371,11 @@ private struct UnavailableAIIntegrationShim: PrivateAIIntegrationProviding {
 
     func unloadCachedRuntime(reason _: String) async {}
 
-    func enhanceDictation(
+    nonisolated func enhanceDictation(
         _ inputText: String,
         runtime _: PrivateAIIntegrationService.RuntimeConfiguration,
-        context _: PrivateAIIntegrationService.AppContext
+        context _: PrivateAIIntegrationService.AppContext,
+        maxOutputTokens _: Int
     ) async throws -> PrivateAIIntegrationService.EnhancementResult {
         PrivateAIIntegrationService.EnhancementResult(
             outputText: inputText,

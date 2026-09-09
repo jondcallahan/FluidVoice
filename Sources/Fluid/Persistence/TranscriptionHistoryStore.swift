@@ -5,12 +5,22 @@
 //  Persistence manager for Transcription Mode history
 //
 
+import AppKit
 import Combine
 import Foundation
 
+nonisolated struct AudioBudgetMeasurementGate: Equatable, Sendable {
+    let revision: UInt64
+    let budgetBytes: Int64
+
+    func accepts(currentRevision: UInt64, currentBudgetBytes: Int64) -> Bool {
+        self.revision == currentRevision && self.budgetBytes == currentBudgetBytes
+    }
+}
+
 // MARK: - Transcription History Entry Model
 
-struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
+struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     let id: UUID
     let timestamp: Date
     let rawText: String
@@ -21,9 +31,13 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
     let wasAIProcessed: Bool
     let processingModel: String?
     /// Wall-clock time spent in AI enhancement, including failed attempts.
+    /// Kept for existing history rows and Stats; new writes also set `aiProcessingDurationMilliseconds`.
     let aiEnhancementDurationMs: Int?
     /// Exact messages sent to the model (system, user, injected context).
     let aiPromptSnapshot: String?
+    let transcriptionDurationMilliseconds: Int?
+    let aiProcessingDurationMilliseconds: Int?
+    let aiTokensPerSecond: Double?
     /// Non-nil when AI post-processing was configured but failed and we fell
     /// back to typing the raw transcription. The string carries the error
     /// message for display / debugging.
@@ -41,6 +55,9 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         processingModel: String? = nil,
         aiEnhancementDurationMs: Int? = nil,
         aiPromptSnapshot: String? = nil,
+        transcriptionDurationMilliseconds: Int? = nil,
+        aiProcessingDurationMilliseconds: Int? = nil,
+        aiTokensPerSecond: Double? = nil,
         aiProcessingError: String? = nil,
         audio: DictationAudioMetadata? = nil
     ) {
@@ -53,8 +70,12 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = processedText.count
         self.wasAIProcessed = wasAIProcessed
         self.processingModel = processingModel
-        self.aiEnhancementDurationMs = aiEnhancementDurationMs
+        let resolvedAIDuration = aiProcessingDurationMilliseconds ?? aiEnhancementDurationMs
+        self.aiEnhancementDurationMs = resolvedAIDuration
         self.aiPromptSnapshot = aiPromptSnapshot
+        self.transcriptionDurationMilliseconds = transcriptionDurationMilliseconds
+        self.aiProcessingDurationMilliseconds = resolvedAIDuration
+        self.aiTokensPerSecond = aiTokensPerSecond
         self.aiProcessingError = aiProcessingError
         self.audio = audio
     }
@@ -71,6 +92,9 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         processingModel: String?,
         aiEnhancementDurationMs: Int?,
         aiPromptSnapshot: String?,
+        transcriptionDurationMilliseconds: Int?,
+        aiProcessingDurationMilliseconds: Int?,
+        aiTokensPerSecond: Double?,
         aiProcessingError: String?,
         audio: DictationAudioMetadata?
     ) {
@@ -85,6 +109,9 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.processingModel = processingModel
         self.aiEnhancementDurationMs = aiEnhancementDurationMs
         self.aiPromptSnapshot = aiPromptSnapshot
+        self.transcriptionDurationMilliseconds = transcriptionDurationMilliseconds
+        self.aiProcessingDurationMilliseconds = aiProcessingDurationMilliseconds
+        self.aiTokensPerSecond = aiTokensPerSecond
         self.aiProcessingError = aiProcessingError
         self.audio = audio
     }
@@ -100,15 +127,31 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.characterCount = try container.decode(Int.self, forKey: .characterCount)
         self.wasAIProcessed = try container.decode(Bool.self, forKey: .wasAIProcessed)
         self.processingModel = try container.decodeIfPresent(String.self, forKey: .processingModel)
-        self.aiEnhancementDurationMs = try container.decodeIfPresent(Int.self, forKey: .aiEnhancementDurationMs)
+        let legacyAIDuration = try container.decodeIfPresent(Int.self, forKey: .aiEnhancementDurationMs)
+        let currentAIDuration = try container.decodeIfPresent(
+            Int.self,
+            forKey: .aiProcessingDurationMilliseconds
+        )
+        let resolvedAIDuration = currentAIDuration ?? legacyAIDuration
+        self.aiEnhancementDurationMs = resolvedAIDuration
         self.aiPromptSnapshot = try container.decodeIfPresent(String.self, forKey: .aiPromptSnapshot)
+        self.transcriptionDurationMilliseconds = try container.decodeIfPresent(
+            Int.self,
+            forKey: .transcriptionDurationMilliseconds
+        )
+        self.aiProcessingDurationMilliseconds = resolvedAIDuration
+        self.aiTokensPerSecond = try container.decodeIfPresent(Double.self, forKey: .aiTokensPerSecond)
         self.aiProcessingError = try container.decodeIfPresent(String.self, forKey: .aiProcessingError)
         self.audio = try container.decodeIfPresent(DictationAudioMetadata.self, forKey: .audio)
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, timestamp, rawText, processedText, appName, windowTitle
-        case characterCount, wasAIProcessed, processingModel, aiEnhancementDurationMs, aiPromptSnapshot, aiProcessingError, audio
+        case characterCount, wasAIProcessed, processingModel
+        case aiEnhancementDurationMs, aiPromptSnapshot
+        case transcriptionDurationMilliseconds, aiProcessingDurationMilliseconds
+        case aiTokensPerSecond
+        case aiProcessingError, audio
     }
 
     /// Preview text for list display (first 80 chars)
@@ -146,6 +189,20 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
         self.audio != nil
     }
 
+    static func formattedDuration(milliseconds: Int) -> String {
+        if milliseconds < 1000 {
+            return "\(milliseconds) ms"
+        }
+        return String(format: "%.1f s", Double(milliseconds) / 1000)
+    }
+
+    static func formattedTokensPerSecond(_ tokensPerSecond: Double, compact: Bool = false) -> String {
+        let rounded = tokensPerSecond >= 100
+            ? String(Int(tokensPerSecond.rounded()))
+            : String(format: "%.1f", tokensPerSecond)
+        return compact ? "\(rounded) tok/s" : "\(rounded) tokens/sec"
+    }
+
     func replacingAudio(_ audio: DictationAudioMetadata?) -> TranscriptionHistoryEntry {
         TranscriptionHistoryEntry(
             id: self.id,
@@ -159,6 +216,9 @@ struct TranscriptionHistoryEntry: Codable, Identifiable, Equatable {
             processingModel: self.processingModel,
             aiEnhancementDurationMs: self.aiEnhancementDurationMs,
             aiPromptSnapshot: self.aiPromptSnapshot,
+            transcriptionDurationMilliseconds: self.transcriptionDurationMilliseconds,
+            aiProcessingDurationMilliseconds: self.aiProcessingDurationMilliseconds,
+            aiTokensPerSecond: self.aiTokensPerSecond,
             aiProcessingError: self.aiProcessingError,
             audio: audio
         )
@@ -209,17 +269,46 @@ struct AIEnhancementModelLatency: Equatable, Identifiable {
 final class TranscriptionHistoryStore: ObservableObject {
     static let shared = TranscriptionHistoryStore()
 
-    private let defaults = UserDefaults.standard
-
-    private enum Keys {
-        static let transcriptionHistory = "TranscriptionHistoryEntries"
-    }
+    private let writer: TranscriptionHistoryWriter
+    private var loadTask: Task<Void, Never>?
+    private var hasLoaded = false
+    private var pendingUpserts: [UUID: TranscriptionHistoryEntry] = [:]
+    private var pendingDeletes: Set<UUID> = []
+    private var pendingReplacement = false
+    @Published private(set) var isLoading = true
+    @Published private(set) var persistenceError: String?
 
     @Published private(set) var entries: [TranscriptionHistoryEntry] = []
     @Published var selectedEntryID: UUID?
+    /// Last completed snapshot while a coalesced background refresh is pending.
+    /// Rendering must never scan history or schedule work.
+    @Published private(set) var todaySummary = TodaySummary(words: 0, transcriptions: 0)
+    private var todaySummaryTask: Task<Void, Never>?
+    private var todaySummaryRevision: UInt64 = 0
+    private var todaySummaryDay: DateInterval?
+    private var audioBudgetRevision: UInt64 = 0
+    private var automaticAudioBudgetTask: Task<Void, Never>?
+    private(set) var audioSaveGeneration: UInt64 = 0
+    private var calendarObservers: [NSObjectProtocol] = []
+    private let summaryNow: () -> Date
+    private let summaryCalendar: () -> Calendar
 
-    private init() {
+    init(
+        writer: TranscriptionHistoryWriter = TranscriptionHistoryWriter(),
+        summaryNow: @escaping () -> Date = Date.init,
+        summaryCalendar: @escaping () -> Calendar = { Calendar.current }
+    ) {
+        self.writer = writer
+        self.summaryNow = summaryNow
+        self.summaryCalendar = summaryCalendar
+        self.observeSummaryCalendarChanges()
         self.loadEntries()
+    }
+
+    deinit {
+        for observer in self.calendarObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     // MARK: - Public Methods
@@ -246,6 +335,9 @@ final class TranscriptionHistoryStore: ObservableObject {
         processingModel: String? = nil,
         aiEnhancementDurationMs: Int? = nil,
         aiPromptSnapshot: String? = nil,
+        transcriptionDurationMilliseconds: Int? = nil,
+        aiProcessingDurationMilliseconds: Int? = nil,
+        aiTokensPerSecond: Double? = nil,
         aiProcessingError: String? = nil,
         audio: DictationAudioMetadata? = nil
     ) {
@@ -263,16 +355,20 @@ final class TranscriptionHistoryStore: ObservableObject {
             processingModel: processingModel,
             aiEnhancementDurationMs: aiEnhancementDurationMs,
             aiPromptSnapshot: aiPromptSnapshot,
+            transcriptionDurationMilliseconds: transcriptionDurationMilliseconds,
+            aiProcessingDurationMilliseconds: aiProcessingDurationMilliseconds,
+            aiTokensPerSecond: aiTokensPerSecond,
             aiProcessingError: aiProcessingError,
             audio: audio
         )
 
         // Insert at beginning (newest first)
         self.entries.insert(entry, at: 0)
+        self.refreshTodaySummary()
 
-        self.saveEntries()
+        self.persist(upserts: [entry])
         if audio != nil {
-            self.pruneAudioToBudget()
+            self.scheduleAutomaticAudioPruneToBudget()
         }
 
         DebugLogger.shared.debug("Added transcription to history (total: \(self.entries.count))", source: "TranscriptionHistoryStore")
@@ -280,41 +376,54 @@ final class TranscriptionHistoryStore: ObservableObject {
 
     /// Delete a specific entry
     func deleteEntry(id: UUID) {
+        self.invalidateAutomaticAudioBudgetMeasurement()
         if let audio = self.entries.first(where: { $0.id == id })?.audio {
             DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
         }
+        let previousCount = self.entries.count
         self.entries.removeAll { $0.id == id }
+        if self.entries.count != previousCount {
+            self.refreshTodaySummary()
+        }
 
         // Clear selection if deleted
         if self.selectedEntryID == id {
             self.selectedEntryID = self.entries.first?.id
         }
 
-        self.saveEntries()
+        self.persist(deletes: [id])
     }
 
     /// Delete multiple entries
     func deleteEntries(ids: Set<UUID>) {
+        self.invalidateAutomaticAudioBudgetMeasurement()
         for entry in self.entries where ids.contains(entry.id) {
             if let audio = entry.audio {
                 DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
             }
         }
+        let previousCount = self.entries.count
         self.entries.removeAll { ids.contains($0.id) }
+        if self.entries.count != previousCount {
+            self.refreshTodaySummary()
+        }
 
         if let selected = selectedEntryID, ids.contains(selected) {
             self.selectedEntryID = self.entries.first?.id
         }
 
-        self.saveEntries()
+        self.persist(deletes: Array(ids))
     }
 
     /// Clear all history
     func clearAllHistory() {
+        self.audioSaveGeneration &+= 1
+        self.invalidateAutomaticAudioBudgetMeasurement()
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
         self.entries.removeAll()
+        self.refreshTodaySummary()
         self.selectedEntryID = nil
-        self.saveEntries()
+        self.persist(replacing: true)
 
         DebugLogger.shared.info("Cleared all transcription history", source: "TranscriptionHistoryStore")
     }
@@ -361,7 +470,9 @@ final class TranscriptionHistoryStore: ObservableObject {
         var latestByModel: [String: Int] = [:]
 
         for entry in entries {
-            guard let duration = entry.aiEnhancementDurationMs, duration >= 0 else { continue }
+            guard let duration = entry.aiProcessingDurationMilliseconds ?? entry.aiEnhancementDurationMs,
+                  duration >= 0
+            else { continue }
             let modelName = entry.processingModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let key = modelName.isEmpty ? "Unknown model" : modelName
             durationsByModel[key, default: []].append(duration)
@@ -398,39 +509,62 @@ final class TranscriptionHistoryStore: ObservableObject {
     }
 
     func restore(from payload: [TranscriptionHistoryEntry]) {
+        self.audioSaveGeneration &+= 1
+        self.invalidateAutomaticAudioBudgetMeasurement()
         self.entries = payload.sorted { $0.timestamp > $1.timestamp }
+        self.refreshTodaySummary()
         self.selectedEntryID = self.entries.first?.id
-        self.saveEntries()
+        self.persist(upserts: self.entries, replacing: true)
     }
 
-    func attachAudio(_ audio: DictationAudioMetadata, to entryID: UUID) {
+    func attachAudio(
+        _ audio: DictationAudioMetadata,
+        to entryID: UUID,
+        expectedSaveGeneration: UInt64? = nil
+    ) {
+        if let expectedSaveGeneration, expectedSaveGeneration != self.audioSaveGeneration {
+            DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
+            return
+        }
         guard let index = self.entries.firstIndex(where: { $0.id == entryID }) else {
             DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
             return
         }
         self.entries[index] = self.entries[index].replacingAudio(audio)
-        self.saveEntries()
-        self.pruneAudioToBudget()
+        self.persist(upserts: [self.entries[index]])
+        self.scheduleAutomaticAudioPruneToBudget()
     }
 
     @discardableResult
     func deleteAllSavedAudio() -> Int {
+        guard self.hasLoaded else { return 0 }
+        self.audioSaveGeneration &+= 1
+        self.invalidateAutomaticAudioBudgetMeasurement()
         let removedCount = self.entries.filter { $0.audio != nil }.count
         DictationAudioHistoryStore.shared.deleteAllAudioFiles()
+        let changed = self.entries.filter { $0.audio != nil }.map { $0.replacingAudio(nil) }
         self.entries = self.entries.map { $0.replacingAudio(nil) }
-        self.saveEntries()
+        self.persist(upserts: changed)
         DebugLogger.shared.info("Deleted saved dictation audio (\(removedCount) entries)", source: "TranscriptionHistoryStore")
         return removedCount
     }
 
     @discardableResult
     func pruneAudioToBudget() -> Int {
+        // An incomplete startup snapshot must never classify older recordings as orphaned.
+        guard self.hasLoaded else { return 0 }
+        self.invalidateAutomaticAudioBudgetMeasurement()
         let budgetBytes = SettingsStore.shared.audioHistoryBudgetBytes
+        let currentBytes = DictationAudioHistoryStore.shared.audioUsageBytes()
+        return self.pruneAudioToBudget(currentBytes: currentBytes, budgetBytes: budgetBytes)
+    }
+
+    private func pruneAudioToBudget(currentBytes initialCurrentBytes: Int64, budgetBytes: Int64) -> Int {
         guard budgetBytes > 0 else {
             return self.deleteAllSavedAudio()
         }
 
-        var currentBytes = DictationAudioHistoryStore.shared.audioUsageBytes()
+        var currentBytes = initialCurrentBytes
         guard currentBytes > budgetBytes else { return 0 }
 
         var updatedEntries = self.entries
@@ -443,11 +577,13 @@ final class TranscriptionHistoryStore: ObservableObject {
         guard currentBytes > budgetBytes else { return 0 }
 
         var prunedCount = 0
+        var changed: [TranscriptionHistoryEntry] = []
         for index in updatedEntries.indices.reversed() {
             guard let audio = updatedEntries[index].audio else { continue }
             let removedBytes = DictationAudioHistoryStore.shared.deleteAudio(fileName: audio.fileName)
             currentBytes = max(0, currentBytes - removedBytes)
             updatedEntries[index] = updatedEntries[index].replacingAudio(nil)
+            changed.append(updatedEntries[index])
             prunedCount += 1
             if currentBytes <= budgetBytes {
                 break
@@ -456,36 +592,201 @@ final class TranscriptionHistoryStore: ObservableObject {
 
         if prunedCount > 0 {
             self.entries = updatedEntries
-            self.saveEntries()
+            self.persist(upserts: changed)
             DebugLogger.shared.info("Pruned saved dictation audio (\(prunedCount) entries)", source: "TranscriptionHistoryStore")
         }
         return prunedCount
     }
 
+    private func invalidateAutomaticAudioBudgetMeasurement() {
+        self.audioBudgetRevision &+= 1
+    }
+
+    private func scheduleAutomaticAudioPruneToBudget() {
+        self.audioBudgetRevision &+= 1
+        guard self.hasLoaded, self.automaticAudioBudgetTask == nil else { return }
+
+        self.automaticAudioBudgetTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while true {
+                let gate = AudioBudgetMeasurementGate(
+                    revision: self.audioBudgetRevision,
+                    budgetBytes: SettingsStore.shared.audioHistoryBudgetBytes
+                )
+                let currentBytes = await Task.detached(priority: .utility) {
+                    DictationAudioHistoryStore.shared.audioUsageBytes()
+                }.value
+                guard gate.accepts(
+                    currentRevision: self.audioBudgetRevision,
+                    currentBudgetBytes: SettingsStore.shared.audioHistoryBudgetBytes
+                ) else {
+                    continue
+                }
+
+                _ = self.pruneAudioToBudget(
+                    currentBytes: currentBytes,
+                    budgetBytes: gate.budgetBytes
+                )
+                self.automaticAudioBudgetTask = nil
+                return
+            }
+        }
+    }
+
     // MARK: - Private Methods
 
     private func loadEntries() {
-        guard let data = defaults.data(forKey: Keys.transcriptionHistory),
-              let decoded = try? JSONDecoder().decode([TranscriptionHistoryEntry].self, from: data)
-        else {
-            self.entries = []
-            return
+        self.isLoading = true
+        self.loadTask = Task { @MainActor in
+            do {
+                let loaded = try await self.writer.load()
+                var merged = self.pendingReplacement ? [] : loaded.filter { !self.pendingDeletes.contains($0.id) && self.pendingUpserts[$0.id] == nil }
+                merged.append(contentsOf: self.pendingUpserts.values)
+                self.entries = merged.sorted { $0.timestamp > $1.timestamp }
+                self.refreshTodaySummary()
+                self.hasLoaded = true
+                self.persistenceError = nil
+                if self.pendingReplacement || !self.pendingUpserts.isEmpty || !self.pendingDeletes.isEmpty {
+                    self.persist(upserts: Array(self.pendingUpserts.values), deletes: Array(self.pendingDeletes), replacing: self.pendingReplacement)
+                }
+                self.pendingUpserts.removeAll()
+                self.pendingDeletes.removeAll()
+                self.pendingReplacement = false
+            } catch {
+                self.persistenceError = "History could not be loaded. New dictations are kept in memory until you retry. \(error.localizedDescription)"
+            }
+            self.isLoading = false
         }
-        self.entries = decoded
     }
 
-    private func saveEntries() {
-        if let encoded = try? JSONEncoder().encode(entries) {
-            self.defaults.set(encoded, forKey: Keys.transcriptionHistory)
+    /// Only immutable changed entries cross to the writer. No full-history encoding on the main actor.
+    private func persist(upserts: [TranscriptionHistoryEntry] = [], deletes: [UUID] = [], replacing: Bool = false) {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        guard self.hasLoaded else {
+            if replacing {
+                self.pendingReplacement = true
+                self.pendingUpserts.removeAll()
+                self.pendingDeletes.removeAll()
+            }
+            for id in deletes {
+                self.pendingUpserts.removeValue(forKey: id)
+                self.pendingDeletes.insert(id)
+            }
+            for entry in upserts {
+                self.pendingDeletes.remove(entry.id)
+                self.pendingUpserts[entry.id] = entry
+            }
+            return
         }
-        objectWillChange.send()
+        self.writer.write(upserts: upserts, deletes: deletes, replacing: replacing) { error in
+            guard let error else { return }
+            Task { @MainActor in
+                self.persistenceError = "History could not be saved. Keep FluidVoice open and retry. \(error.localizedDescription)"
+            }
+        }
+        DebugLogger.shared.info(
+            "HISTORY_BENCH enqueueMs=\((ProcessInfo.processInfo.systemUptime - startedAt) * 1000) upserts=\(upserts.count) deletes=\(deletes.count)",
+            source: "TranscriptionHistoryStore"
+        )
+    }
+
+    func retryPersistence() {
+        guard !self.isLoading else { return }
+        guard self.hasLoaded else {
+            self.loadEntries()
+            return
+        }
+        self.writer.write(upserts: self.entries, replacing: true) { error in
+            Task { @MainActor in
+                self.persistenceError = error.map { "History could not be saved. \($0.localizedDescription)" }
+            }
+        }
+    }
+
+    func waitUntilLoaded() async throws {
+        await self.loadTask?.value
+        guard self.hasLoaded else {
+            throw NSError(domain: "HistoryPersistence", code: 1, userInfo: [NSLocalizedDescriptionKey: self.persistenceError ?? "History is unavailable."])
+        }
+    }
+
+    func finishPendingWrites() async {
+        await self.loadTask?.value
+        if let error = await self.writer.drain() {
+            self.persistenceError = "History could not be saved. Keep FluidVoice open and retry. \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Event-driven Today Snapshot
+
+    private func observeSummaryCalendarChanges() {
+        let names: [Notification.Name] = [
+            .NSCalendarDayChanged, .NSSystemTimeZoneDidChange, .NSSystemClockDidChange,
+            NSLocale.currentLocaleDidChangeNotification, NSApplication.didBecomeActiveNotification,
+        ]
+        self.calendarObservers = names.map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshTodaySummaryForCalendarChange()
+                }
+            }
+        }
+    }
+
+    func refreshTodaySummaryForCalendarChange() {
+        let day = self.summaryCalendar().dateInterval(of: .day, for: self.summaryNow())
+        guard day != self.todaySummaryDay else { return }
+        self.refreshTodaySummary()
+    }
+
+    private func refreshTodaySummary() {
+        self.todaySummaryRevision &+= 1
+        guard self.todaySummaryTask == nil else { return }
+        self.todaySummaryTask = Task { @MainActor [weak self] in
+            // Coalesce synchronous load/restore/delete bursts into one immutable snapshot.
+            await Task.yield()
+            guard let self else { return }
+            while true {
+                let revision = self.todaySummaryRevision
+                let day = self.summaryCalendar().dateInterval(of: .day, for: self.summaryNow())
+                let snapshot = self.entries
+                let summary = await Task.detached(priority: .utility) {
+                    Self.calculateTodaySummary(entries: snapshot, day: day)
+                }.value
+                guard revision == self.todaySummaryRevision,
+                      day == self.summaryCalendar().dateInterval(of: .day, for: self.summaryNow())
+                else { continue }
+                self.todaySummaryDay = day
+                if self.todaySummary != summary {
+                    self.todaySummary = summary
+                }
+                // Published subscribers may synchronously mutate history again.
+                guard revision == self.todaySummaryRevision else { continue }
+                self.todaySummaryTask = nil
+                return
+            }
+        }
+    }
+
+    func waitForTodaySummary() async {
+        await self.todaySummaryTask?.value
+    }
+
+    private nonisolated static func calculateTodaySummary(entries: [TranscriptionHistoryEntry], day: DateInterval?) -> TodaySummary {
+        guard let day else { return TodaySummary(words: 0, transcriptions: 0) }
+        let totals = entries.reduce(into: (words: 0, transcriptions: 0)) { result, entry in
+            guard entry.timestamp >= day.start, entry.timestamp < day.end else { return }
+            result.words += Self.countWords(in: entry.processedText)
+            result.transcriptions += 1
+        }
+        return TodaySummary(words: totals.words, transcriptions: totals.transcriptions)
     }
 }
 
 // MARK: - Stats Computation Extension
 
 extension TranscriptionHistoryStore {
-    struct TodaySummary {
+    nonisolated struct TodaySummary: Equatable, Sendable {
         let words: Int
         let transcriptions: Int
 
@@ -521,6 +822,10 @@ extension TranscriptionHistoryStore {
 
     /// Count words in a string (handles multiple spaces, newlines)
     private func wordCount(in text: String) -> Int {
+        Self.countWords(in: text)
+    }
+
+    private nonisolated static func countWords(in text: String) -> Int {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return 0 }
 
@@ -532,18 +837,6 @@ extension TranscriptionHistoryStore {
     /// Total words across all transcriptions
     var totalWords: Int {
         self.entries.reduce(0) { $0 + self.wordCount(in: $1.processedText) }
-    }
-
-    /// Summary for today's activity, calculated in one pass.
-    var todaySummary: TodaySummary {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let totals = self.entries.reduce(into: (words: 0, transcriptions: 0)) { result, entry in
-            guard calendar.isDate(entry.timestamp, inSameDayAs: today) else { return }
-            result.words += self.wordCount(in: entry.processedText)
-            result.transcriptions += 1
-        }
-        return TodaySummary(words: totals.words, transcriptions: totals.transcriptions)
     }
 
     /// Words transcribed today

@@ -10,6 +10,7 @@ import SwiftUI
 
 private struct PromptCardAssignments {
     let isDefault: Bool
+    let isReady: Bool
     let shortcutDisplay: String?
     let modelPicker: PromptCardModelPicker?
     let onMakeDefault: () -> Void
@@ -282,6 +283,16 @@ extension AIEnhancementSettingsView {
         isEnabled: Bool
     ) -> some View {
         HStack(spacing: 6) {
+            if !assignments.isReady {
+                self.promptConfigChip(
+                    systemImage: "exclamationmark.triangle.fill",
+                    text: assignments.modelPicker?.providerName.isEmpty == false
+                        ? "Needs setup"
+                        : "No valid provider configured",
+                    tone: .orange
+                )
+            }
+
             // Provider chip
             if let modelPicker = assignments.modelPicker, !modelPicker.providerName.isEmpty {
                 self.promptConfigChip(
@@ -421,12 +432,35 @@ extension AIEnhancementSettingsView {
         let configuration = self.settings.dictationPromptConfiguration(for: selection)
         return PromptCardAssignments(
             isDefault: self.viewModel.isDictationPromptSelection(selection, for: .primary),
+            isReady: self.isPromptConfigurationReady(selection: selection, isPrivateAI: isPrivateAI),
             shortcutDisplay: configuration.shortcut?.displayString,
             modelPicker: self.promptModelPicker(selection: selection, isPrivateAI: isPrivateAI),
             onMakeDefault: {
                 self.viewModel.setDictationPromptSelection(selection, for: .primary)
             }
         )
+    }
+
+    private func isPromptConfigurationReady(
+        selection: SettingsStore.DictationPromptSelection,
+        isPrivateAI: Bool
+    ) -> Bool {
+        if isPrivateAI {
+            return self.viewModel.isPrivateAIPromptAvailable()
+        }
+
+        let configuration = self.settings.dictationPromptConfiguration(for: selection)
+        let configuredProviderID = configuration.providerID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let providerID = configuredProviderID.isEmpty
+            ? self.defaultExternalPromptProviderID
+            : configuredProviderID
+        let configuredModel = configuration.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = configuredModel.isEmpty ? self.viewModel.selectedModel(for: providerID) : configuredModel
+        return !providerID.isEmpty && !model.isEmpty && self.viewModel.connectionStatus(for: providerID) == .success
+    }
+
+    private var defaultExternalPromptProviderID: String {
+        DictationProviderRoute.externalFallbackProviderID(from: self.settings.selectedProviderID)
     }
 
     private func promptEditorSelection(for mode: PromptEditorMode) -> SettingsStore.DictationPromptSelection? {
@@ -522,10 +556,35 @@ extension AIEnhancementSettingsView {
         NotificationCenter.default.post(name: .dictationPromptShortcutsChanged, object: nil)
     }
 
+    private func hasDefaultPromptCustomization(for mode: SettingsStore.PromptMode) -> Bool {
+        if self.viewModel.hasDefaultPromptOverride(for: mode) {
+            return true
+        }
+        guard mode.normalized == .dictate else { return false }
+        let configuration = self.settings.dictationPromptConfiguration(for: .default)
+        return configuration.shortcut != nil ||
+            !configuration.providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            !configuration.modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func resetDefaultPrompt(for mode: SettingsStore.PromptMode) {
+        self.viewModel.resetDefaultPromptOverride(for: mode)
+        if mode.normalized == .dictate {
+            self.settings.removeDictationPromptConfiguration(for: .default)
+            self.promptEditorOriginalConfiguration = nil
+            self.promptEditorShortcutDraft = nil
+            self.promptEditorProviderIDDraft = ""
+            self.promptEditorModelDraft = ""
+            NotificationCenter.default.post(name: .dictationPromptShortcutsChanged, object: nil)
+        }
+        self.viewModel.openDefaultPromptViewer(for: mode)
+    }
+
     private func promptEditorAssignments(mode: PromptEditorMode) -> PromptCardAssignments? {
         if case .newPrompt = mode {
             return PromptCardAssignments(
                 isDefault: false,
+                isReady: self.isPromptEditorConfigurationReady(),
                 shortcutDisplay: self.promptEditorShortcutDraft?.displayString,
                 modelPicker: self.promptEditorModelPicker(),
                 onMakeDefault: {
@@ -538,12 +597,21 @@ extension AIEnhancementSettingsView {
 
         return PromptCardAssignments(
             isDefault: self.promptEditorPrimarySelectionDraft == selection,
+            isReady: mode.isPrivateAI
+                ? self.viewModel.isPrivateAIPromptAvailable()
+                : self.isPromptEditorConfigurationReady(),
             shortcutDisplay: self.promptEditorShortcutDraft?.displayString,
             modelPicker: self.promptEditorModelPicker(),
             onMakeDefault: {
                 self.promptEditorPrimarySelectionDraft = selection
             }
         )
+    }
+
+    private func isPromptEditorConfigurationReady() -> Bool {
+        let providerID = self.promptEditorProviderIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = self.promptEditorModelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !providerID.isEmpty && !model.isEmpty && self.viewModel.connectionStatus(for: providerID) == .success
     }
 
     private func promptEditorModelPicker() -> PromptCardModelPicker? {
@@ -837,11 +905,10 @@ extension AIEnhancementSettingsView {
             )
         }
 
-        guard !self.viewModel.isPrivateAIModelSelected() else { return nil }
         let configuration = self.settings.dictationPromptConfiguration(for: selection)
         let configuredProviderID = configuration.providerID.trimmingCharacters(in: .whitespacesAndNewlines)
         let providerID = configuredProviderID.isEmpty
-            ? self.viewModel.selectedProviderID.trimmingCharacters(in: .whitespacesAndNewlines)
+            ? self.defaultExternalPromptProviderID
             : configuredProviderID
         guard !providerID.isEmpty else {
             return PromptCardModelPicker(
@@ -941,109 +1008,82 @@ extension AIEnhancementSettingsView {
     private func promptModeSection(mode: SettingsStore.PromptMode) -> some View {
         let customProfiles = self.viewModel.dictationPromptProfiles
             .filter { $0.mode.normalized == mode }
-        let isPrivateAI = mode.normalized == .dictate && self.viewModel.isPrivateAIModelSelected()
-        let isSelectedAppsOnly = !isPrivateAI && self.viewModel.promptRoutingScope(for: mode) == .selectedAppsOnly
+        let privateAIAvailable = mode.normalized == .dictate && self.viewModel.isPrivateAIPromptAvailable()
+        let isSelectedAppsOnly = self.viewModel.promptRoutingScope(for: mode) == .selectedAppsOnly
 
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 10) {
-                if isPrivateAI {
+                self.promptRoutingScopeRow(mode: mode)
+
+                if mode.normalized == .dictate {
+                    self.customPromptOnlyToggleRow
+                    self.contextAwarenessSection
+                }
+
+                Text(
+                    isSelectedAppsOnly
+                        ? "Custom prompts only run in apps listed in App Overrides."
+                        : "Custom prompts run based on your shortcut or the app you're in."
+                )
+                .font(.caption2)
+                .foregroundStyle(self.theme.palette.secondaryText)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 2)
+
+                if privateAIAvailable {
                     let privateAISelection = SettingsStore.DictationPromptSelection.privateAI
                     self.promptProfileCard(
                         cardKey: "\(mode.normalized.rawValue)-\(PrivateAIProviderFeature.shared.providerID)",
                         title: PrivateAIProviderFeature.displayName,
                         subtitle: "",
                         mode: mode,
-                        isSelected: true,
+                        isSelected: self.viewModel.isPrivateAIPromptSelected(),
                         assignments: self.promptAssignments(selection: privateAISelection, isPrivateAI: true),
                         onManage: { self.viewModel.openPrivateAIPromptEditor() },
                         isEnabled: true
                     )
+                }
 
-                    self.privateAIOnlyNotice
-                } else {
-                    self.promptRoutingScopeRow(mode: mode)
-
-                    if mode.normalized == .dictate {
-                        self.customPromptOnlyToggleRow
-                        self.contextAwarenessSection
-                    }
-
-                    Text(
-                        isSelectedAppsOnly
-                            ? "Custom prompts only run in apps listed in App Overrides."
-                            : "Custom prompts run based on your shortcut or the app you're in."
+                Group {
+                    let defaultSelection = SettingsStore.DictationPromptSelection.default
+                    self.promptProfileCard(
+                        cardKey: "\(mode.normalized.rawValue)-default",
+                        title: mode.normalized == .dictate ? "Built-in Default" : "Default \(self.friendlyModeName(mode))",
+                        subtitle: "",
+                        mode: mode,
+                        isSelected: self.viewModel.selectedPromptID(for: mode) == nil,
+                        assignments: mode.normalized == .dictate
+                            ? self.promptAssignments(selection: defaultSelection)
+                            : nil,
+                        onManage: { self.viewModel.openDefaultPromptViewer(for: mode) },
+                        isEnabled: !isSelectedAppsOnly
                     )
-                    .font(.caption2)
-                    .foregroundStyle(self.theme.palette.secondaryText)
-                    .padding(.horizontal, 4)
-                    .padding(.bottom, 2)
 
-                    Group {
-                        let defaultSelection = SettingsStore.DictationPromptSelection.default
-                        self.promptProfileCard(
-                            cardKey: "\(mode.normalized.rawValue)-default",
-                            title: mode.normalized == .dictate ? "Built-in Default" : "Default \(self.friendlyModeName(mode))",
-                            subtitle: "",
-                            mode: mode,
-                            isSelected: mode.normalized == .dictate
-                                ? (self.viewModel.selectedPromptID(for: mode) == nil)
-                                : (self.viewModel.selectedPromptID(for: mode) == nil),
-                            assignments: mode.normalized == .dictate
-                                ? self.promptAssignments(selection: defaultSelection)
-                                : nil,
-                            onManage: { self.viewModel.openDefaultPromptViewer(for: mode) },
-                            isEnabled: !isSelectedAppsOnly
-                        )
-
-                        if !customProfiles.isEmpty {
-                            ForEach(customProfiles) { profile in
-                                let profileSelection = SettingsStore.DictationPromptSelection.profile(profile.id)
-                                self.promptProfileCard(
-                                    cardKey: "\(profile.mode.normalized.rawValue)-\(profile.id)",
-                                    title: profile.name.isEmpty ? "Untitled Prompt" : profile.name,
-                                    subtitle: "",
-                                    mode: profile.mode,
-                                    isSelected: self.viewModel.selectedPromptID(for: profile.mode) == profile.id,
-                                    assignments: profile.mode.normalized == .dictate
-                                        ? self.promptAssignments(selection: profileSelection)
-                                        : nil,
-                                    onManage: { self.viewModel.openEditor(for: profile) },
-                                    onDelete: { self.viewModel.requestDeletePrompt(profile) },
-                                    isEnabled: !isSelectedAppsOnly
-                                )
-                            }
+                    if !customProfiles.isEmpty {
+                        ForEach(customProfiles) { profile in
+                            let profileSelection = SettingsStore.DictationPromptSelection.profile(profile.id)
+                            self.promptProfileCard(
+                                cardKey: "\(profile.mode.normalized.rawValue)-\(profile.id)",
+                                title: profile.name.isEmpty ? "Untitled Prompt" : profile.name,
+                                subtitle: "",
+                                mode: profile.mode,
+                                isSelected: self.viewModel.selectedPromptID(for: profile.mode) == profile.id,
+                                assignments: profile.mode.normalized == .dictate
+                                    ? self.promptAssignments(selection: profileSelection)
+                                    : nil,
+                                onManage: { self.viewModel.openEditor(for: profile) },
+                                onDelete: { self.viewModel.requestDeletePrompt(profile) },
+                                isEnabled: !isSelectedAppsOnly
+                            )
                         }
                     }
-                    .opacity(isSelectedAppsOnly ? 0.5 : 1)
-
-                    self.appPromptBindingsSection(mode: mode, isEmphasized: isSelectedAppsOnly, isEnabled: true)
                 }
+                .opacity(isSelectedAppsOnly ? 0.5 : 1)
+
+                self.appPromptBindingsSection(mode: mode, isEmphasized: isSelectedAppsOnly, isEnabled: true)
             }
         }
         .padding(.top, 2)
-    }
-
-    private var privateAIOnlyNotice: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "lock.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text("\(PrivateAIProviderFeature.displayName) uses its own built-in system prompt. Switch to another provider to create custom prompts.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(self.theme.palette.cardBackground)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(self.theme.palette.cardBorder, lineWidth: 1)
-                )
-        )
     }
 
     private func promptModeHintRow(mode: SettingsStore.PromptMode) -> some View {
@@ -1088,7 +1128,7 @@ extension AIEnhancementSettingsView {
 
             if mode.normalized == .edit {
                 self.editModeInlineModelControls
-            } else if !self.viewModel.isPrivateAIModelSelected() {
+            } else {
                 Button {
                     self.viewModel.openNewPromptEditor(prefillMode: .dictate)
                 } label: {
@@ -1191,7 +1231,7 @@ extension AIEnhancementSettingsView {
                 }
             } else {
                 let providerID = self.activeEditModeProviderID
-                let models = self.viewModel.models(for: providerID)
+                let models = self.editModeModels(for: providerID)
                 Group {
                     Toggle("Sync", isOn: self.editModeLinkedToGlobalBinding)
                         .toggleStyle(.checkbox)
@@ -1227,7 +1267,10 @@ extension AIEnhancementSettingsView {
                     SearchableModelPicker(
                         models: models,
                         selectedModel: self.editModeModelBinding(for: providerID),
-                        onRefresh: { await self.viewModel.fetchModels(for: providerID) },
+                        onRefresh: {
+                            guard !self.isPrivateAIProviderID(providerID) else { return }
+                            await self.viewModel.fetchModels(for: providerID)
+                        },
                         isRefreshing: self.viewModel.refreshingProviderID == providerID,
                         refreshEnabled: !self.settings.rewriteModeLinkedToGlobal && self.canFetchModels(for: providerID),
                         selectionEnabled: !self.settings.rewriteModeLinkedToGlobal && !models.isEmpty,
@@ -1452,7 +1495,7 @@ extension AIEnhancementSettingsView {
 
     private var activeEditModeProviderID: String {
         if self.settings.rewriteModeLinkedToGlobal {
-            return self.viewModel.selectedProviderID
+            return self.settings.selectedProviderID
         }
         return self.editModeSelectedProviderID
     }
@@ -1470,7 +1513,7 @@ extension AIEnhancementSettingsView {
             set: { newProviderID in
                 guard !self.settings.rewriteModeLinkedToGlobal else { return }
                 self.settings.rewriteModeSelectedProviderID = newProviderID
-                let models = self.viewModel.models(for: newProviderID)
+                let models = self.editModeModels(for: newProviderID)
                 let current = self.settings.rewriteModeSelectedModel ?? ""
                 if !models.contains(current) {
                     self.settings.rewriteModeSelectedModel = models.first
@@ -1482,14 +1525,17 @@ extension AIEnhancementSettingsView {
     private func editModeModelBinding(for providerID: String) -> Binding<String> {
         Binding(
             get: {
+                let models = self.editModeModels(for: providerID)
                 if self.settings.rewriteModeLinkedToGlobal {
                     let key = self.viewModel.providerKey(for: providerID)
-                    return self.settings.selectedModelByProvider[key]
+                    let preferred = self.settings.selectedModelByProvider[key]
                         ?? self.settings.selectedModel
-                        ?? self.viewModel.models(for: providerID).first
-                        ?? ""
+                    return ModelRepository.eligibleModel(preferred: preferred, from: models) ?? ""
                 }
-                return self.settings.rewriteModeSelectedModel ?? self.viewModel.models(for: providerID).first ?? ""
+                return ModelRepository.eligibleModel(
+                    preferred: self.settings.rewriteModeSelectedModel,
+                    from: models
+                ) ?? ""
             },
             set: { newModel in
                 guard !self.settings.rewriteModeLinkedToGlobal else { return }
@@ -1506,7 +1552,7 @@ extension AIEnhancementSettingsView {
         }
 
         let providerID = self.settings.rewriteModeSelectedProviderID
-        let models = self.viewModel.models(for: providerID)
+        let models = self.editModeModels(for: providerID)
         let currentModel = self.settings.rewriteModeSelectedModel ?? ""
         if !models.contains(currentModel) {
             self.settings.rewriteModeSelectedModel = models.first
@@ -1514,7 +1560,7 @@ extension AIEnhancementSettingsView {
     }
 
     private func syncEditModeToGlobalSelection() {
-        let global = self.viewModel.selectedProviderID
+        let global = self.settings.selectedProviderID
         guard !global.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             self.settings.rewriteModeSelectedProviderID = ""
             self.settings.rewriteModeSelectedModel = nil
@@ -1523,11 +1569,29 @@ extension AIEnhancementSettingsView {
 
         self.settings.rewriteModeSelectedProviderID = global
 
+        if self.isPrivateAIProviderID(global) {
+            self.settings.rewriteModeSelectedModel = self.editModeModels(for: global).first
+            return
+        }
+
         let key = self.viewModel.providerKey(for: global)
         let model = self.settings.selectedModelByProvider[key]
             ?? self.settings.selectedModel
             ?? self.viewModel.models(for: global).first
         self.settings.rewriteModeSelectedModel = model
+    }
+
+    private func editModeModels(for providerID: String) -> [String] {
+        if self.isPrivateAIProviderID(providerID) {
+            return ModelRepository.shared.defaultModels(for: providerID, task: .edit)
+        }
+        return self.viewModel.models(for: providerID)
+    }
+
+    private func isPrivateAIProviderID(_ providerID: String) -> Bool {
+        PrivateFeatures.privateAIProvider &&
+            providerID.trimmingCharacters(in: .whitespacesAndNewlines)
+            == PrivateAIProviderFeature.shared.providerID
     }
 
     private func ensureDefaultEditModeSyncState() {
@@ -1708,14 +1772,21 @@ extension AIEnhancementSettingsView {
                             }
 
                             let hotkeyDisplay = self.settings.primaryDictationShortcutDisplayString
-                            let canTest = self.viewModel.isAIPostProcessingConfiguredForDictation()
+                            let canTest = DictationAIPostProcessingGate.isProviderConfigured(
+                                providerID: self.promptEditorProviderIDDraft,
+                                model: self.promptEditorModelDraft
+                            )
 
                             Toggle(isOn: Binding(
                                 get: { self.promptTest.isActive },
                                 set: { enabled in
                                     if enabled {
                                         let combined = self.viewModel.combinedDraftPrompt(self.viewModel.draftPromptText, mode: self.viewModel.draftPromptMode)
-                                        self.promptTest.activate(draftPromptText: combined)
+                                        self.promptTest.activate(
+                                            draftPromptText: combined,
+                                            providerID: self.promptEditorProviderIDDraft,
+                                            model: self.promptEditorModelDraft
+                                        )
                                     } else {
                                         self.promptTest.deactivate()
                                     }
@@ -1821,15 +1892,14 @@ extension AIEnhancementSettingsView {
             HStack(spacing: 10) {
                 if mode.isDefault,
                    let promptMode = mode.mode,
-                   self.viewModel.hasDefaultPromptOverride(for: promptMode)
+                   self.hasDefaultPromptCustomization(for: promptMode)
                 {
-                    Button("Reset to Built-in") {
-                        self.viewModel.resetDefaultPromptOverride(for: promptMode)
-                        self.viewModel.openDefaultPromptViewer(for: promptMode)
-                        self.preparePromptEditorConfigurationDraft(mode: .defaultPrompt(mode: promptMode))
+                    Button("Reset Default") {
+                        self.resetDefaultPrompt(for: promptMode)
                     }
                     .fluidButton(.compact, size: .compact)
                     .frame(minWidth: AISettingsLayout.primaryActionMinWidth, minHeight: AISettingsLayout.controlHeight)
+                    .help("Clear the custom prompt, provider, model, and shortcut")
                 }
 
                 Spacer(minLength: 0)
@@ -1860,6 +1930,12 @@ extension AIEnhancementSettingsView {
         }
         .onChange(of: self.viewModel.promptEditorSessionID) { _, _ in
             self.preparePromptEditorConfigurationDraft(mode: mode)
+        }
+        .onChange(of: self.promptEditorProviderIDDraft) { _, providerID in
+            self.promptTest.updateDraftConfiguration(providerID: providerID, model: self.promptEditorModelDraft)
+        }
+        .onChange(of: self.promptEditorModelDraft) { _, model in
+            self.promptTest.updateDraftConfiguration(providerID: self.promptEditorProviderIDDraft, model: model)
         }
         .onChange(of: self.activeShortcutRecordingTarget) { oldValue, newValue in
             if case .newPrompt = mode {

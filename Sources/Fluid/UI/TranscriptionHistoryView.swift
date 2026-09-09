@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 struct TranscriptionHistoryView: View {
     @ObservedObject private var historyStore = TranscriptionHistoryStore.shared
+    @ObservedObject private var settings = SettingsStore.shared
     @Environment(\.theme) private var theme
 
     @State private var searchQuery: String = ""
@@ -30,6 +31,20 @@ struct TranscriptionHistoryView: View {
                 self.searchBar
                     .padding(12)
 
+                if self.historyStore.isLoading {
+                    ProgressView("Loading history…")
+                        .padding(12)
+                } else if let error = self.historyStore.persistenceError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error)
+                            .font(.caption)
+                        Button("Retry saving history") {
+                            self.historyStore.retryPersistence()
+                        }
+                    }
+                    .padding(12)
+                }
+
                 Divider()
                     .opacity(0.3)
 
@@ -42,6 +57,7 @@ struct TranscriptionHistoryView: View {
 
                 // Footer with stats and clear button
                 self.footerView
+                    .disabled(self.historyStore.isLoading)
             }
             .frame(minWidth: 280, idealWidth: 320, maxWidth: 400)
             .background(self.theme.palette.contentBackground)
@@ -147,22 +163,38 @@ struct TranscriptionHistoryView: View {
                         .foregroundStyle(isSelected ? .white : .secondary)
                         .lineLimit(1)
 
-                    if entry.wasAIProcessed {
-                        Text("AI")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(isSelected ? .white.opacity(0.8) : self.theme.palette.accent)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(
-                                RoundedRectangle(cornerRadius: 3)
-                                    .fill(isSelected ? .white.opacity(0.2) : self.theme.palette.accent.opacity(0.15))
-                            )
+                    if self.settings.showHistoryPerformanceMetrics,
+                       let duration = entry.transcriptionDurationMilliseconds
+                    {
+                        self.processingBadge(
+                            text: "ASR \(TranscriptionHistoryEntry.formattedDuration(milliseconds: duration))",
+                            isSelected: isSelected,
+                            isAccent: false
+                        )
                     }
 
-                    if let duration = entry.formattedAIEnhancementDuration {
-                        Text(duration)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(isSelected ? .white.opacity(0.75) : Color.secondary.opacity(0.8))
+                    if self.settings.showHistoryPerformanceMetrics,
+                       entry.wasAIProcessed || entry.aiProcessingError != nil
+                    {
+                        self.processingBadge(
+                            text: entry.aiProcessingDurationMilliseconds.map {
+                                "AI \(TranscriptionHistoryEntry.formattedDuration(milliseconds: $0))"
+                            } ?? "AI",
+                            isSelected: isSelected,
+                            isAccent: true
+                        )
+                    } else if entry.wasAIProcessed {
+                        self.processingBadge(text: "AI", isSelected: isSelected, isAccent: true)
+                    }
+
+                    if self.settings.showHistoryPerformanceMetrics,
+                       let tokensPerSecond = entry.aiTokensPerSecond
+                    {
+                        self.processingBadge(
+                            text: TranscriptionHistoryEntry.formattedTokensPerSecond(tokensPerSecond, compact: true),
+                            isSelected: isSelected,
+                            isAccent: true
+                        )
                     }
 
                     if self.hasAudio(entry) {
@@ -561,11 +593,33 @@ struct TranscriptionHistoryView: View {
                 self.metadataItem(icon: "character.cursor.ibeam", label: "Characters", value: "\(entry.characterCount)")
                 self.metadataItem(icon: "sparkles", label: "AI Processed", value: entry.wasAIProcessed ? "Yes" : "No")
                 self.metadataItem(icon: "cpu", label: "AI Model", value: model.isEmpty ? "—" : model)
-                self.metadataItem(
-                    icon: "timer",
-                    label: "AI Latency",
-                    value: entry.formattedAIEnhancementDuration ?? "—"
-                )
+                if self.settings.showHistoryPerformanceMetrics,
+                   let duration = entry.transcriptionDurationMilliseconds
+                {
+                    self.metadataItem(
+                        icon: "waveform",
+                        label: "Transcription Time",
+                        value: TranscriptionHistoryEntry.formattedDuration(milliseconds: duration)
+                    )
+                }
+                if self.settings.showHistoryPerformanceMetrics,
+                   let duration = entry.aiProcessingDurationMilliseconds ?? entry.aiEnhancementDurationMs
+                {
+                    self.metadataItem(
+                        icon: "sparkles",
+                        label: "Cleanup Time",
+                        value: TranscriptionHistoryEntry.formattedDuration(milliseconds: duration)
+                    )
+                }
+                if self.settings.showHistoryPerformanceMetrics,
+                   let tokensPerSecond = entry.aiTokensPerSecond
+                {
+                    self.metadataItem(
+                        icon: "speedometer",
+                        label: "AI Speed",
+                        value: TranscriptionHistoryEntry.formattedTokensPerSecond(tokensPerSecond)
+                    )
+                }
                 self.metadataItem(icon: "waveform", label: "Audio", value: self.audioMetadataText(for: entry))
             }
         }
@@ -594,6 +648,28 @@ struct TranscriptionHistoryView: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8)
             .fill(self.theme.palette.cardBackground.opacity(0.9)))
+    }
+
+    private func processingBadge(
+        text: String,
+        isSelected: Bool,
+        isAccent: Bool
+    ) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(
+                isSelected ? .white.opacity(0.8) : (isAccent ? self.theme.palette.accent : Color.secondary)
+            )
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(
+                        isSelected
+                            ? .white.opacity(0.2)
+                            : (isAccent ? self.theme.palette.accent.opacity(0.15) : Color.secondary.opacity(0.12))
+                    )
+            )
     }
 
     private func copyToClipboard(_ text: String) {

@@ -18,7 +18,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     private var shouldSuppressNextReopenActivation = false
     private var wasLaunchedAsLoginItem = false
     private var analyticsActivationSuppressionDeadline: Date?
-    private var hasDeferredMLXUpgradeOffer = false
 
     var shouldPresentStartupMicrophoneNotice: Bool {
         !self.wasLaunchedAsLoginItem || SettingsStore.shared.showMainWindowAtLoginLaunch
@@ -27,6 +26,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Bring up file logging + crash handlers immediately during launch.
         _ = FileLogger.shared
+        TypingService.startKeyboardLayoutTracking()
+        _ = TranscriptionHistoryStore.shared
         // Must be read during the launch callback - the current Apple Event identifies
         // login-item launches (used to optionally start silently, see issue #369).
         self.wasLaunchedAsLoginItem = Self.detectLoginItemLaunch()
@@ -41,7 +42,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         // Initialize app settings (dock visibility, etc.)
         SettingsStore.shared.initializeAppSettings()
-        let shouldOfferMLXUpgrade = PrivateAIMLXUpgradeCoordinator.prepareOfferIfNeeded()
         LocalAPIServer.shared.start()
 
         // Record first-open synchronously before async analytics bootstrap so
@@ -60,16 +60,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Login Items can launch hidden; reveal the real SwiftUI window so ContentView startup runs.
         self.openMainWindowOnLaunch()
 
-        if shouldOfferMLXUpgrade {
-            if self.wasLaunchedAsLoginItem, !SettingsStore.shared.showMainWindowAtLoginLaunch {
-                self.hasDeferredMLXUpgradeOffer = true
-            } else {
-                self.scheduleMLXUpgradeOffer()
-            }
-        }
-
         // Note: App UI is designed with dark color scheme in mind
         // All gradients and effects are optimized for dark mode
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            await TranscriptionHistoryStore.shared.finishPendingWrites()
+            if let error = TranscriptionHistoryStore.shared.persistenceError {
+                let alert = NSAlert()
+                alert.messageText = "History could not be saved"
+                alert.informativeText = error
+                alert.addButton(withTitle: "Keep Open")
+                alert.addButton(withTitle: "Quit Anyway")
+                sender.reply(toApplicationShouldTerminate: alert.runModal() == .alertSecondButtonReturn)
+                return
+            }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -128,22 +137,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return true
         }
 
-        // Ensure dock-icon reopen always foregrounds FluidVoice.
+        // LaunchServices can restore the bundle's regular activation policy when
+        // reopening a running app, so reapply the user's Dock preference first.
+        self.applyDockVisibilityPolicy()
         sender.activate(ignoringOtherApps: true)
 
         return !self.bringMainWindowToFrontIfPresent()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        DispatchQueue.global(qos: .utility).async {
+            try? KeychainService.shared.refreshCachedKeys()
+        }
         if let deadline = self.analyticsActivationSuppressionDeadline, Date() <= deadline {
             self.analyticsActivationSuppressionDeadline = nil
         } else {
             self.analyticsActivationSuppressionDeadline = nil
             AnalyticsService.shared.recordAppActivity()
-        }
-        if self.hasDeferredMLXUpgradeOffer {
-            self.hasDeferredMLXUpgradeOffer = false
-            self.scheduleMLXUpgradeOffer()
         }
     }
 
@@ -225,30 +235,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     self.requestMainWindowReopenIfNeeded(activate: revealWindow)
                 }
             }
-        }
-    }
-
-    private func scheduleMLXUpgradeOffer() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.showMLXUpgradeOffer()
-        }
-    }
-
-    @MainActor
-    private func showMLXUpgradeOffer() {
-        let alert = NSAlert()
-        alert.messageText = "Fluid-1 is now 2.2x faster"
-        alert.informativeText = "A new 3.77 GB MLX model is available for Apple silicon. Continue to AI Enhancement to download and verify it. Your current slower model will keep working unless you choose to upgrade."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Continue to Download")
-        alert.addButton(withTitle: "Keep Current Model")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            PrivateAIMLXUpgradeCoordinator.beginUpgrade()
-            AppNavigationRouter.shared.request(.aiEnhancements)
-            self.bringMainWindowToFront()
-        } else {
-            PrivateAIMLXUpgradeCoordinator.keepCurrentModel()
         }
     }
 

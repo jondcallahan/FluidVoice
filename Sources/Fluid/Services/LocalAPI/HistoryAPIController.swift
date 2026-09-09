@@ -20,6 +20,9 @@ struct HistoryAPIController: LocalAPIRouteHandler {
         let processingModel: String?
         let aiEnhancementDurationMs: Int?
         let aiPromptSnapshot: String?
+        let transcriptionDurationMilliseconds: Int?
+        let aiProcessingDurationMilliseconds: Int?
+        let aiTokensPerSecond: Double?
         let aiProcessingError: String?
     }
 
@@ -29,6 +32,11 @@ struct HistoryAPIController: LocalAPIRouteHandler {
         }
 
         let limit = LocalAPI.boundedLimit(from: request)
+        do {
+            try await TranscriptionHistoryStore.shared.waitUntilLoaded()
+        } catch {
+            return LocalAPI.error("History is unavailable. Retry from History in FluidVoice.", status: 503)
+        }
         let items = TranscriptionHistoryStore.shared.entries
             .prefix(limit)
             .map { entry in
@@ -46,6 +54,9 @@ struct HistoryAPIController: LocalAPIRouteHandler {
                     processingModel: entry.processingModel,
                     aiEnhancementDurationMs: entry.aiEnhancementDurationMs,
                     aiPromptSnapshot: entry.aiPromptSnapshot,
+                    transcriptionDurationMilliseconds: entry.transcriptionDurationMilliseconds,
+                    aiProcessingDurationMilliseconds: entry.aiProcessingDurationMilliseconds,
+                    aiTokensPerSecond: entry.aiTokensPerSecond,
                     aiProcessingError: entry.aiProcessingError
                 )
             }
